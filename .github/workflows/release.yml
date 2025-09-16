@@ -1,0 +1,223 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-amd64:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24.1'
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y build-essential pkg-config libsystemd-dev
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Build for Linux AMD64
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s -X main.version=$VERSION" -o clustereye-agent-linux-amd64 cmd/agent/main.go
+
+    - name: Create checksum
+      run: |
+        sha256sum clustereye-agent-linux-amd64 > clustereye-agent-linux-amd64.sha256
+
+    - name: Upload Linux AMD64 artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-amd64
+        path: |
+          clustereye-agent-linux-amd64
+          clustereye-agent-linux-amd64.sha256
+
+  build-linux-arm64:
+    runs-on: self-hosted
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Build ARM64 binary with Docker
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        
+        # Create Dockerfile for ARM64 build
+        cat > Dockerfile.arm64 <<EOF
+        FROM --platform=linux/arm64 golang:1.24.1-bookworm
+        
+        # Install build dependencies
+        RUN apt-get update && apt-get install -y \\
+            build-essential \\
+            pkg-config \\
+            libsystemd-dev \\
+            && rm -rf /var/lib/apt/lists/*
+        
+        WORKDIR /build
+        COPY . .
+        
+        # Download dependencies and build
+        RUN go mod download
+        RUN CGO_ENABLED=1 go build -ldflags="-w -s -X main.version=$VERSION" -o clustereye-agent-linux-arm64 cmd/agent/main.go
+        EOF
+        
+        # Build using Docker with ARM64 platform
+        docker build --platform linux/arm64 -f Dockerfile.arm64 -t clustereye-arm64-builder .
+        
+        # Extract the binary from container
+        docker create --name temp-container clustereye-arm64-builder
+        docker cp temp-container:/build/clustereye-agent-linux-arm64 ./clustereye-agent-linux-arm64
+        docker rm temp-container
+        
+        # Cleanup
+        docker rmi clustereye-arm64-builder
+        rm Dockerfile.arm64
+
+    - name: Create checksum
+      run: |
+        shasum -a 256 clustereye-agent-linux-arm64 > clustereye-agent-linux-arm64.sha256
+
+    - name: Upload Linux ARM64 artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-arm64
+        path: |
+          clustereye-agent-linux-arm64
+          clustereye-agent-linux-arm64.sha256
+
+  release:
+    needs: [build-linux-amd64, build-linux-arm64]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        merge-multiple: true
+
+    - name: Prepare config file
+      run: |
+        if [ -f cmd/agent/agent.yml ]; then
+          cp cmd/agent/agent.yml config.yaml
+        fi
+
+    - name: Create and push tag
+      run: |
+        VERSION="${{ github.event.inputs.version }}"
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git tag "v$VERSION"
+        git push origin "v$VERSION"
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          clustereye-agent-linux-amd64
+          clustereye-agent-linux-amd64.sha256
+          clustereye-agent-linux-arm64
+          clustereye-agent-linux-arm64.sha256
+          config.yaml
+          LICENSE
+        tag_name: v${{ github.event.inputs.version }}
+        name: ClusterEye Agent v${{ github.event.inputs.version }}
+        body: |
+          ## ClusterEye Agent v${{ github.event.inputs.version }}
+
+          ClusterEye Agent is a database monitoring agent that supports PostgreSQL, MongoDB, and MS SQL Server monitoring.
+
+          ### Download:
+
+          **Linux AMD64:**
+          - `clustereye-agent-linux-amd64`
+          - `clustereye-agent-linux-amd64.sha256`
+
+          **Linux ARM64:**
+          - `clustereye-agent-linux-arm64`
+          - `clustereye-agent-linux-arm64.sha256`
+
+          ### Installation:
+
+          ```bash
+          # Download and install (AMD64)
+          wget https://github.com/CloudNativeWorks/clustereye-agent/releases/download/v${{ github.event.inputs.version }}/clustereye-agent-linux-amd64
+          sudo mv clustereye-agent-linux-amd64 /usr/local/bin/clustereye-agent
+          sudo chmod +x /usr/local/bin/clustereye-agent
+
+          # Download and install (ARM64)
+          wget https://github.com/CloudNativeWorks/clustereye-agent/releases/download/v${{ github.event.inputs.version }}/clustereye-agent-linux-arm64
+          sudo mv clustereye-agent-linux-arm64 /usr/local/bin/clustereye-agent
+          sudo chmod +x /usr/local/bin/clustereye-agent
+
+          # Download config template
+          wget https://github.com/CloudNativeWorks/clustereye-agent/releases/download/v${{ github.event.inputs.version }}/config.yaml
+          sudo mkdir -p /etc/clustereye
+          sudo mv config.yaml /etc/clustereye/agent.yml
+
+          # Edit configuration
+          sudo nano /etc/clustereye/agent.yml
+
+          # Install and start as service
+          sudo clustereye-agent -service install
+          sudo clustereye-agent -service start
+          ```
+
+          ### Usage:
+
+          ```bash
+          # Run with specific platform
+          clustereye-agent -platform postgres
+          clustereye-agent -platform mongo
+          clustereye-agent -platform mssql
+
+          # Set log level
+          clustereye-agent -loglevel DEBUG
+
+          # Show version
+          clustereye-agent -version
+
+          # Show help
+          clustereye-agent -help
+
+          # Service management
+          clustereye-agent -service install
+          clustereye-agent -service uninstall
+          clustereye-agent -service start
+          clustereye-agent -service stop
+          ```
+
+          ### Configuration:
+
+          The agent looks for configuration in `/etc/clustereye/agent.yml`
+
+          ### Verification:
+
+          ```bash
+          # For AMD64
+          sha256sum -c clustereye-agent-linux-amd64.sha256
+
+          # For ARM64
+          sha256sum -c clustereye-agent-linux-arm64.sha256
+          ```
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
