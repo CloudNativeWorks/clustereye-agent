@@ -1,0 +1,3525 @@
+package postgres
+
+import (
+	"bufio"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	_ "github.com/lib/pq"
+	pb "github.com/sefaphlvn/clustereye-test/pkg/agent"
+	"github.com/senbaris/clustereye-agent/internal/config"
+	"github.com/senbaris/clustereye-agent/internal/logger"
+	"github.com/senbaris/clustereye-agent/pkg/utils"
+)
+
+// PatroniInfo contains information about Patroni configuration
+type PatroniInfo struct {
+	IsEnabled     bool   `json:"is_enabled"`
+	ClusterName   string `json:"cluster_name,omitempty"`
+	MemberName    string `json:"member_name,omitempty"`
+	Role          string `json:"role,omitempty"`          // "Leader", "Replica", "Unknown"
+	State         string `json:"state,omitempty"`         // "running", "stopped", etc.
+	RestAPIPort   int    `json:"rest_api_port,omitempty"` // Usually 8008
+	DetectionInfo string `json:"detection_info,omitempty"`
+}
+
+// PatroniCommand represents a Patroni management command
+type PatroniCommand struct {
+	Command      string            `json:"command"`
+	Args         []string          `json:"args"`
+	Description  string            `json:"description"`
+	Category     string            `json:"category"` // "cluster", "node", "maintenance", "failover"
+	RequiresAuth bool              `json:"requires_auth"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+}
+
+// PatroniManager handles Patroni cluster management operations
+type PatroniManager struct {
+	cfg           *config.AgentConfig
+	patroniInfo   *PatroniInfo
+	patroniCtlCmd string // Path to patronictl command
+	configPath    string // Path to patroni config file
+}
+
+// Common Patroni management commands
+var PatroniCommands = map[string]PatroniCommand{
+	// Cluster Status & Info
+	"list": {
+		Command:      "list",
+		Args:         []string{},
+		Description:  "Show cluster members and their status",
+		Category:     "cluster",
+		RequiresAuth: false,
+	},
+	"topology": {
+		Command:      "topology",
+		Args:         []string{},
+		Description:  "Show cluster topology",
+		Category:     "cluster",
+		RequiresAuth: false,
+	},
+	"history": {
+		Command:      "history",
+		Args:         []string{},
+		Description:  "Show cluster history",
+		Category:     "cluster",
+		RequiresAuth: false,
+	},
+
+	// Node Management
+	"reload": {
+		Command:      "reload",
+		Args:         []string{},
+		Description:  "Reload configuration on current node",
+		Category:     "node",
+		RequiresAuth: true,
+	},
+	"restart": {
+		Command:      "restart",
+		Args:         []string{},
+		Description:  "Restart PostgreSQL on current node",
+		Category:     "node",
+		RequiresAuth: true,
+	},
+	"reinit": {
+		Command:      "reinit",
+		Args:         []string{},
+		Description:  "Reinitialize current node",
+		Category:     "node",
+		RequiresAuth: true,
+	},
+
+	// Maintenance Mode
+	"pause": {
+		Command:      "pause",
+		Args:         []string{},
+		Description:  "Put cluster in maintenance mode",
+		Category:     "maintenance",
+		RequiresAuth: true,
+	},
+	"resume": {
+		Command:      "resume",
+		Args:         []string{},
+		Description:  "Resume cluster from maintenance mode",
+		Category:     "maintenance",
+		RequiresAuth: true,
+	},
+
+	// Failover & Switchover
+	"failover": {
+		Command:      "failover",
+		Args:         []string{"--force"},
+		Description:  "Perform manual failover (non-interactive)",
+		Category:     "failover",
+		RequiresAuth: true,
+	},
+	"switchover": {
+		Command:      "switchover",
+		Args:         []string{"--force"},
+		Description:  "Perform planned switchover (non-interactive)",
+		Category:     "failover",
+		RequiresAuth: true,
+	},
+}
+
+// PostgresCollector represents a PostgreSQL collector with rate limiting and circuit breaker
+type PostgresCollector struct {
+	cfg                *config.AgentConfig
+	lastCollectionTime time.Time
+	collectionInterval time.Duration
+	maxRetries         int
+	backoffDuration    time.Duration
+	isHealthy          bool
+	lastHealthCheck    time.Time
+}
+
+// NewPostgresCollector creates a new PostgreSQL collector with rate limiting
+func NewPostgresCollector(cfg *config.AgentConfig) *PostgresCollector {
+	return &PostgresCollector{
+		cfg:                cfg,
+		collectionInterval: 30 * time.Second, // Minimum 30 seconds between collections
+		maxRetries:         3,
+		backoffDuration:    5 * time.Second,
+		isHealthy:          true,
+		lastHealthCheck:    time.Now(),
+	}
+}
+
+// CanCollect checks if enough time has passed since last collection to prevent rate limiting
+func (c *PostgresCollector) CanCollect() bool {
+	if time.Since(c.lastCollectionTime) < c.collectionInterval {
+		logger.Debug("PostgreSQL Rate limiting: Not enough time passed since last collection (min interval: %v)", c.collectionInterval)
+		return false
+	}
+	return true
+}
+
+// SetCollectionTime updates the last collection time
+func (c *PostgresCollector) SetCollectionTime() {
+	c.lastCollectionTime = time.Now()
+}
+
+// IsHealthy returns the current health state
+func (c *PostgresCollector) IsHealthy() bool {
+	// Check health every 2 minutes
+	if time.Since(c.lastHealthCheck) > 2*time.Minute {
+		c.checkHealth()
+	}
+	return c.isHealthy
+}
+
+// checkHealth performs a simple health check - INDEPENDENT of rate limiting
+func (c *PostgresCollector) checkHealth() {
+	c.lastHealthCheck = time.Now()
+
+	// CRITICAL: Health check must be independent of rate limiting to allow recovery
+	// Don't use c.openDB() because it checks ShouldSkipCollection
+	cfg, err := config.LoadAgentConfig()
+	if err != nil {
+		c.isHealthy = false
+		logger.Warning("PostgreSQL health check failed - config load error: %v", err)
+		c.collectionInterval = 2 * time.Minute
+		return
+	}
+
+	// Direct connection for health check - bypass all rate limiting
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable connect_timeout=3",
+		cfg.PostgreSQL.Host,
+		cfg.PostgreSQL.Port,
+		cfg.PostgreSQL.User,
+		cfg.PostgreSQL.Pass,
+		"postgres",
+	)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		c.isHealthy = false
+		logger.Warning("PostgreSQL health check failed - connection open error: %v", err)
+		c.collectionInterval = 2 * time.Minute
+		return
+	}
+
+	// Set minimal connection limits for health check
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(5 * time.Second)
+
+	// Quick test query with very short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var result int
+	err = db.QueryRowContext(ctx, "SELECT 1").Scan(&result)
+	db.Close()
+
+	if err != nil {
+		c.isHealthy = false
+		logger.Warning("PostgreSQL health check query failed - marking collector as unhealthy: %v", err)
+		c.collectionInterval = 2 * time.Minute
+	} else {
+		// RECOVERY: If we were unhealthy, log recovery
+		if !c.isHealthy {
+			logger.Info("PostgreSQL collector RECOVERED - marking as healthy")
+		}
+		c.isHealthy = true
+		logger.Debug("PostgreSQL health check passed - collector is healthy")
+		c.collectionInterval = 30 * time.Second // Reset to normal interval
+	}
+}
+
+// ForceHealthCheck forces an immediate health check - useful for recovery
+func (c *PostgresCollector) ForceHealthCheck() {
+	logger.Info("PostgreSQL collector forcing health check for recovery")
+	c.checkHealth()
+}
+
+// ShouldSkipCollection determines if collection should be skipped due to rate limiting or health issues
+func (c *PostgresCollector) ShouldSkipCollection() bool {
+	if !c.CanCollect() {
+		return true
+	}
+
+	// Check health but allow more frequent recovery attempts
+	if !c.IsHealthy() {
+		// AGGRESSIVE RECOVERY: Try recovery every 2 minutes instead of 5
+		if time.Since(c.lastHealthCheck) > 2*time.Minute {
+			logger.Info("PostgreSQL collector has been unhealthy for 2+ minutes, attempting aggressive recovery...")
+			c.ForceHealthCheck()
+
+			// If still unhealthy after forced check, skip collection
+			if !c.isHealthy {
+				logger.Debug("PostgreSQL recovery attempt failed, skipping collection")
+				return true
+			}
+			logger.Info("PostgreSQL collector successfully recovered!")
+		} else {
+			logger.Debug("Skipping PostgreSQL collection due to unhealthy state")
+			return true
+		}
+	}
+
+	return false
+}
+
+// ResetToHealthy forces the collector to healthy state - useful for startup recovery
+func (c *PostgresCollector) ResetToHealthy() {
+	collectorMutex.Lock()
+	defer collectorMutex.Unlock()
+
+	if c != nil {
+		c.isHealthy = true
+		c.collectionInterval = 30 * time.Second
+		c.lastHealthCheck = time.Now()
+		c.lastCollectionTime = time.Time{} // Reset to allow immediate collection
+		logger.Info("PostgreSQL collector forcefully reset to healthy state")
+	}
+}
+
+// StartupRecovery performs recovery checks at agent startup
+func (c *PostgresCollector) StartupRecovery() {
+	logger.Info("PostgreSQL collector performing startup recovery check...")
+
+	// Give it 3 attempts at startup
+	for i := 0; i < 3; i++ {
+		c.ForceHealthCheck()
+		if c.isHealthy {
+			logger.Info("PostgreSQL collector startup recovery successful on attempt %d", i+1)
+			return
+		}
+		logger.Warning("PostgreSQL collector startup recovery attempt %d failed, retrying...", i+1)
+		time.Sleep(2 * time.Second)
+	}
+
+	// If all attempts failed, force reset to healthy
+	logger.Warning("PostgreSQL collector startup recovery failed after 3 attempts, forcing healthy state")
+	c.ResetToHealthy()
+}
+
+// openDB creates a database connection with proper timeouts and limits
+func (c *PostgresCollector) openDB() (*sql.DB, error) {
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable connect_timeout=10",
+		c.cfg.PostgreSQL.Host,
+		c.cfg.PostgreSQL.Port,
+		c.cfg.PostgreSQL.User,
+		c.cfg.PostgreSQL.Pass,
+		"postgres",
+	)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("PostgreSQL connection failed: %w", err)
+	}
+
+	// Set connection pool limits to prevent resource exhaustion
+	db.SetMaxOpenConns(2)                   // Maximum 2 concurrent connections
+	db.SetMaxIdleConns(1)                   // Keep maximum 1 idle connection
+	db.SetConnMaxLifetime(30 * time.Second) // Close connections after 30 seconds
+	db.SetConnMaxIdleTime(10 * time.Second) // Close idle connections after 10 seconds
+
+	// Test the connection with a shorter timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err = db.PingContext(ctx)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("PostgreSQL connection test failed: %w", err)
+	}
+
+	return db, nil
+}
+
+// GetPostgresInfo collects PostgreSQL information with rate limiting protection
+func (c *PostgresCollector) GetPostgresInfo() map[string]interface{} {
+	// Check if we should skip collection due to rate limiting or health issues
+	if c.ShouldSkipCollection() {
+		logger.Warning("PostgreSQL collection skipped due to rate limiting or health checks - providing fallback info")
+		// Instead of returning full cached info, provide minimal service status
+		return c.getMinimalServiceInfo()
+	}
+
+	// Update collection time at the start to prevent concurrent collections
+	c.SetCollectionTime()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetPostgresInfo: %v", r)
+			// Log call stack for better debugging
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			logger.Error("STACK: %s", string(buf[:n]))
+
+			// Mark as unhealthy after panic
+			c.isHealthy = false
+			c.collectionInterval = 5 * time.Minute // Increase interval significantly
+		}
+	}()
+
+	logger.Info("PostgreSQL bilgileri toplanmaya başlanıyor...")
+
+	// Get hostname
+	hostname, _ := os.Hostname()
+
+	// Get raw values first
+	rawMemory := c.getTotalMemory()
+	rawCpu := c.getTotalvCpu()
+
+	// Ensure consistent formatting to prevent false change detection
+	// API compares values as strings, so we need to avoid scientific notation
+	normalizedMemory := rawMemory
+	if normalizedMemory < 0 {
+		normalizedMemory = 0
+	}
+
+	normalizedCpu := rawCpu
+	if normalizedCpu <= 0 {
+		normalizedCpu = 1
+	}
+
+	// Detect Patroni management
+	patroniInfo := c.DetectPatroni()
+
+	// Create info object with format-consistent values
+	info := map[string]interface{}{
+		"hostname":              hostname,
+		"service_status":        c.getServiceStatus(),
+		"version":               c.getVersion(),
+		"node_status":           c.getNodeStatus(),
+		"replication_lag":       c.getReplicationLag(),
+		"total_memory":          normalizedMemory, // Use normalized int64 to avoid scientific notation
+		"total_vcpu":            normalizedCpu,    // Use normalized int32
+		"cluster_name":          c.cfg.PostgreSQL.Cluster,
+		"location":              c.cfg.PostgreSQL.Location,
+		"ip":                    c.getLocalIP(),
+		"config_path":           c.getConfigPath(),
+		"data_path":             c.getDataPath(),
+		"timestamp":             time.Now().Unix(),
+		"collection_successful": true,
+		// Patroni information
+		"patroni_enabled":   patroniInfo.IsEnabled,
+		"patroni_cluster":   patroniInfo.ClusterName,
+		"patroni_role":      patroniInfo.Role,
+		"patroni_state":     patroniInfo.State,
+		"patroni_rest_api":  patroniInfo.RestAPIPort,
+		"patroni_detection": patroniInfo.DetectionInfo,
+	}
+
+	// Apply normalization to ensure consistency
+	normalizePostgresInfo(info)
+
+	// Enhanced debug logging with format consistency check
+	logger.Debug("POSTGRES VALUES (NORMALIZED) - TotalMemory: %d, TotalvCpu: %d",
+		info["total_memory"], info["total_vcpu"])
+
+	// Additional format verification log
+	if memVal, ok := info["total_memory"].(int64); ok {
+		logger.Debug("POSTGRES MEMORY FORMAT CHECK - Value: %d, Scientific: %e",
+			memVal, float64(memVal))
+	}
+
+	logger.Info("PostgreSQL bilgileri başarıyla toplandı. Status=%s, Version=%s",
+		info["service_status"], info["version"])
+
+	return info
+}
+
+// normalizePostgresInfo ensures all data types and formats are consistent to avoid false change detection
+func normalizePostgresInfo(info map[string]interface{}) {
+	if info == nil {
+		return
+	}
+
+	// Normalize total_memory to ensure int64 format without scientific notation
+	if memVal, exists := info["total_memory"]; exists {
+		switch v := memVal.(type) {
+		case int64:
+			if v < 0 {
+				info["total_memory"] = int64(0)
+			}
+		case int:
+			info["total_memory"] = int64(v)
+		case float64:
+			info["total_memory"] = int64(v)
+		default:
+			// Set default if invalid type
+			info["total_memory"] = int64(8 * 1024 * 1024 * 1024) // 8GB default
+		}
+	}
+
+	// Normalize total_vcpu to ensure int32 format
+	if cpuVal, exists := info["total_vcpu"]; exists {
+		switch v := cpuVal.(type) {
+		case int32:
+			if v <= 0 {
+				info["total_vcpu"] = int32(1)
+			}
+		case int:
+			if v <= 0 {
+				info["total_vcpu"] = int32(1)
+			} else {
+				info["total_vcpu"] = int32(v)
+			}
+		case int64:
+			if v <= 0 {
+				info["total_vcpu"] = int32(1)
+			} else {
+				info["total_vcpu"] = int32(v)
+			}
+		case float64:
+			if v <= 0 {
+				info["total_vcpu"] = int32(1)
+			} else {
+				info["total_vcpu"] = int32(v)
+			}
+		default:
+			// Set default if invalid type
+			info["total_vcpu"] = int32(1)
+		}
+	}
+
+	// Normalize replication_lag to ensure float64 format
+	if lagVal, exists := info["replication_lag"]; exists {
+		switch v := lagVal.(type) {
+		case float64:
+			if v < 0 {
+				info["replication_lag"] = float64(0)
+			}
+		case float32:
+			if v < 0 {
+				info["replication_lag"] = float64(0)
+			} else {
+				info["replication_lag"] = float64(v)
+			}
+		case int:
+			info["replication_lag"] = float64(v)
+		case int64:
+			info["replication_lag"] = float64(v)
+		default:
+			// Set default if invalid type
+			info["replication_lag"] = float64(0)
+		}
+	}
+
+	// Normalize string fields to avoid whitespace comparison issues
+	stringFields := []string{"hostname", "service_status", "version", "node_status",
+		"cluster_name", "location", "ip", "config_path", "data_path"}
+
+	for _, field := range stringFields {
+		if val, exists := info[field]; exists {
+			if strVal, ok := val.(string); ok {
+				info[field] = strings.TrimSpace(strVal)
+			}
+		}
+	}
+
+	// Normalize timestamp to ensure int64 format
+	if tsVal, exists := info["timestamp"]; exists {
+		switch v := tsVal.(type) {
+		case int64:
+			// Already correct format
+		case int:
+			info["timestamp"] = int64(v)
+		case float64:
+			info["timestamp"] = int64(v)
+		default:
+			// Set current timestamp if invalid
+			info["timestamp"] = time.Now().Unix()
+		}
+	}
+}
+
+// getMinimalServiceInfo returns minimal service information when rate limited
+func (c *PostgresCollector) getMinimalServiceInfo() map[string]interface{} {
+	hostname, _ := os.Hostname()
+
+	// Get raw values and normalize them
+	rawMemory := GetTotalMemory()
+	rawCpu := GetTotalvCpu()
+
+	normalizedMemory := rawMemory
+	if normalizedMemory < 0 {
+		normalizedMemory = 0
+	}
+
+	normalizedCpu := rawCpu
+	if normalizedCpu <= 0 {
+		normalizedCpu = 1
+	}
+
+	// Provide minimal but useful information even when rate limited
+	info := map[string]interface{}{
+		"hostname":              hostname,
+		"service_status":        "CHECKING", // Instead of RATE_LIMITED which causes alarms
+		"version":               "Checking",
+		"node_status":           "Checking",
+		"replication_lag":       float64(0.0),     // Ensure float64 format
+		"total_memory":          normalizedMemory, // Use normalized int64
+		"total_vcpu":            normalizedCpu,    // Use normalized int32
+		"cluster_name":          "",
+		"location":              "",
+		"ip":                    c.getLocalIP(),
+		"timestamp":             time.Now().Unix(),
+		"rate_limited":          true,
+		"collection_successful": false,
+	}
+
+	// Try to at least get service status without rate limiting
+	cfg, err := config.LoadAgentConfig()
+	if err == nil && cfg.PostgreSQL.Host != "" {
+		host := cfg.PostgreSQL.Host
+		if host == "" {
+			host = "localhost"
+		}
+		port := cfg.PostgreSQL.Port
+		if port == "" {
+			port = "5432"
+		}
+
+		// Quick TCP check without rate limiting
+		address := fmt.Sprintf("%s:%s", host, port)
+		conn, err := net.DialTimeout("tcp", address, 1*time.Second)
+		if err == nil && conn != nil {
+			conn.Close()
+			info["service_status"] = "RUNNING"
+		} else {
+			info["service_status"] = "FAIL!"
+		}
+
+		if cfg.PostgreSQL.Cluster != "" {
+			info["cluster_name"] = cfg.PostgreSQL.Cluster
+		}
+		if cfg.PostgreSQL.Location != "" {
+			info["location"] = cfg.PostgreSQL.Location
+		}
+	}
+
+	// Apply normalization to ensure consistency
+	normalizePostgresInfo(info)
+
+	logger.Debug("Returned minimal service info to prevent alarm while rate limited")
+	return info
+}
+
+// getLastKnownGoodInfo returns cached information to avoid excessive DB calls
+func (c *PostgresCollector) getLastKnownGoodInfo() map[string]interface{} {
+	hostname, _ := os.Hostname()
+
+	// Get raw values and normalize them
+	rawMemory := GetTotalMemory()
+	rawCpu := GetTotalvCpu()
+
+	normalizedMemory := rawMemory
+	if normalizedMemory < 0 {
+		normalizedMemory = 0
+	}
+
+	normalizedCpu := rawCpu
+	if normalizedCpu <= 0 {
+		normalizedCpu = 1
+	}
+
+	info := map[string]interface{}{
+		"hostname":        hostname,
+		"service_status":  "RATE_LIMITED",
+		"version":         "Rate Limited",
+		"node_status":     "Rate Limited",
+		"replication_lag": float64(0.0),     // Ensure float64 format
+		"total_memory":    normalizedMemory, // Use normalized int64
+		"total_vcpu":      normalizedCpu,    // Use normalized int32
+		"cluster_name":    c.cfg.PostgreSQL.Cluster,
+		"location":        c.cfg.PostgreSQL.Location,
+		"ip":              c.getLocalIP(),
+		"timestamp":       time.Now().Unix(),
+		"rate_limited":    true,
+	}
+
+	// Apply normalization to ensure consistency
+	normalizePostgresInfo(info)
+
+	return info
+}
+
+// Wrapper methods that use rate limiting
+func (c *PostgresCollector) getServiceStatus() string {
+	// Use existing GetPGServiceStatus function but with protection
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in getServiceStatus: %v", r)
+			if c != nil {
+				c.isHealthy = false
+			}
+		}
+	}()
+
+	return GetPGServiceStatus()
+}
+
+func (c *PostgresCollector) getVersion() string {
+	// Use existing GetPGVersion function but with protection
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in getVersion: %v", r)
+			if c != nil {
+				c.isHealthy = false
+			}
+		}
+	}()
+
+	return GetPGVersion()
+}
+
+func (c *PostgresCollector) getNodeStatus() string {
+	// Use existing GetNodeStatus function but with protection
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in getNodeStatus: %v", r)
+			if c != nil {
+				c.isHealthy = false
+			}
+		}
+	}()
+
+	return GetNodeStatus()
+}
+
+func (c *PostgresCollector) getReplicationLag() float64 {
+	// Use existing GetReplicationLagSec function but with protection
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in getReplicationLag: %v", r)
+			if c != nil {
+				c.isHealthy = false
+			}
+		}
+	}()
+
+	return GetReplicationLagSec()
+}
+
+func (c *PostgresCollector) getTotalMemory() int64 {
+	return GetTotalMemory()
+}
+
+func (c *PostgresCollector) getTotalvCpu() int32 {
+	return GetTotalvCpu()
+}
+
+func (c *PostgresCollector) getLocalIP() string {
+	// Simple IP detection
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "Unknown"
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
+}
+
+func (c *PostgresCollector) getConfigPath() string {
+	configPath, _ := FindPostgresConfigFile()
+	return configPath
+}
+
+func (c *PostgresCollector) getDataPath() string {
+	dataPath, _ := GetDataDirectory()
+	return dataPath
+}
+
+// Global collector instance for backward compatibility
+var defaultPostgresCollector *PostgresCollector
+var collectorMutex sync.RWMutex // Thread-safe access
+
+func init() {
+	// Initialize default collector with panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in PostgreSQL collector init(): %v", r)
+			// Try to create a minimal collector as last resort
+			collectorMutex.Lock()
+			if defaultPostgresCollector == nil {
+				defaultPostgresCollector = &PostgresCollector{
+					collectionInterval: 30 * time.Second,
+					maxRetries:         3,
+					backoffDuration:    5 * time.Second,
+					isHealthy:          true,
+					lastHealthCheck:    time.Now(),
+				}
+			}
+			collectorMutex.Unlock()
+			log.Printf("PostgreSQL collector init() recovered from panic")
+		}
+	}()
+
+	// Initialize default collector - will be updated when config is available
+	collectorMutex.Lock()
+	defaultPostgresCollector = &PostgresCollector{
+		collectionInterval: 30 * time.Second,
+		maxRetries:         3,
+		backoffDuration:    5 * time.Second,
+		isHealthy:          true,
+		lastHealthCheck:    time.Now(),
+	}
+	collectorMutex.Unlock()
+	log.Printf("PostgreSQL default collector initialized in init() with thread safety")
+
+	// DON'T perform startup recovery automatically in init()
+	// Let the agent explicitly decide when to start collector based on platform
+	// This prevents PostgreSQL collector from starting in MSSQL agents
+	log.Printf("PostgreSQL collector init() completed - startup recovery will be triggered by agent if needed")
+}
+
+// EnsureDefaultCollector ensures the default collector is initialized (thread-safe)
+func EnsureDefaultCollector() {
+	// First quick read-only check
+	collectorMutex.RLock()
+	if defaultPostgresCollector != nil {
+		logger.Debug("EnsureDefaultCollector: Collector already exists")
+		collectorMutex.RUnlock()
+		return
+	}
+	collectorMutex.RUnlock()
+
+	logger.Debug("EnsureDefaultCollector: Collector is nil, acquiring write lock")
+
+	// Need to create new collector
+	collectorMutex.Lock()
+	defer collectorMutex.Unlock()
+
+	// Double-check in case another goroutine created it
+	if defaultPostgresCollector == nil {
+		logger.Warning("EnsureDefaultCollector: Creating new collector - this should only happen once")
+
+		// Try to create with proper recovery
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("PANIC in EnsureDefaultCollector: %v", r)
+				// Create minimal collector as fallback
+				defaultPostgresCollector = &PostgresCollector{
+					collectionInterval: 30 * time.Second,
+					maxRetries:         3,
+					backoffDuration:    5 * time.Second,
+					isHealthy:          true,
+					lastHealthCheck:    time.Now(),
+				}
+				logger.Error("EnsureDefaultCollector: Created fallback collector after panic")
+			}
+		}()
+
+		defaultPostgresCollector = &PostgresCollector{
+			collectionInterval: 30 * time.Second,
+			maxRetries:         3,
+
+			backoffDuration: 5 * time.Second,
+			isHealthy:       true,
+			lastHealthCheck: time.Now(),
+		}
+		logger.Info("EnsureDefaultCollector: Successfully created new collector")
+	} else {
+		logger.Debug("EnsureDefaultCollector: Another goroutine already created collector")
+	}
+}
+
+// GetDefaultCollectorSafe returns the default collector in a thread-safe manner
+func GetDefaultCollectorSafe() *PostgresCollector {
+	// Implement panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetDefaultCollectorSafe: %v", r)
+		}
+	}()
+
+	collectorMutex.RLock()
+	defer collectorMutex.RUnlock()
+
+	if defaultPostgresCollector == nil {
+		logger.Error("GetDefaultCollectorSafe: Collector is nil - this should not happen!")
+		return nil
+	}
+
+	logger.Debug("GetDefaultCollectorSafe: Returning healthy collector")
+	return defaultPostgresCollector
+}
+
+// UpdateDefaultPostgresCollector updates the default collector with proper config (thread-safe)
+func UpdateDefaultPostgresCollector(cfg *config.AgentConfig) {
+	collectorMutex.Lock()
+	defer collectorMutex.Unlock()
+	defaultPostgresCollector = NewPostgresCollector(cfg)
+	log.Printf("PostgreSQL default collector updated with new config (thread-safe)")
+
+	// Perform startup recovery to ensure collector starts healthy - ONLY for PostgreSQL agents
+	go func() {
+		// Wait a bit for initialization to complete
+		time.Sleep(1 * time.Second)
+		if defaultPostgresCollector != nil {
+			// Check if this is a PostgreSQL agent before running startup recovery
+			if cfg.PostgreSQL.Host == "" || cfg.PostgreSQL.User == "" {
+				log.Printf("PostgreSQL collector update: No PostgreSQL config found, skipping startup recovery for non-PostgreSQL agent")
+				return
+			}
+
+			log.Printf("PostgreSQL collector performing startup recovery after config update...")
+			defaultPostgresCollector.StartupRecovery()
+		}
+	}()
+}
+
+// GetDefaultPostgresCollector returns the default collector instance (thread-safe)
+func GetDefaultPostgresCollector() *PostgresCollector {
+	return GetDefaultCollectorSafe()
+}
+
+// PostgresLogFile PostgreSQL log dosyasını temsil eder
+type PostgresLogFile struct {
+	Name         string
+	Path         string
+	Size         int64
+	LastModified int64
+}
+
+// ToProto PostgreSQL log dosyasını proto mesajına dönüştürür
+// NOT: Proto dosyasına FileInfo eklendiğinde bunu güncelleyin
+func (p *PostgresLogFile) ToProto() map[string]interface{} {
+	return map[string]interface{}{
+		"name":          p.Name,
+		"path":          p.Path,
+		"size":          p.Size,
+		"last_modified": p.LastModified,
+	}
+}
+
+// OpenDB veritabanı bağlantısını açar
+func OpenDB() (*sql.DB, error) {
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in OpenDB: %v", r)
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
+			}
+		}
+	}()
+
+	cfg, err := config.LoadAgentConfig()
+	if err != nil {
+		return nil, fmt.Errorf("konfigürasyon yüklenemedi: %v", err)
+	}
+
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable connect_timeout=10",
+		cfg.PostgreSQL.Host,
+		cfg.PostgreSQL.Port,
+		cfg.PostgreSQL.User,
+		cfg.PostgreSQL.Pass,
+		"postgres",
+	)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set connection pool limits to prevent resource exhaustion
+	db.SetMaxOpenConns(2)                   // Maximum 2 concurrent connections
+	db.SetMaxIdleConns(1)                   // Keep maximum 1 idle connection
+	db.SetConnMaxLifetime(30 * time.Second) // Close connections after 30 seconds
+	db.SetConnMaxIdleTime(10 * time.Second) // Close idle connections after 10 seconds
+
+	return db, nil
+}
+
+func GetPGServiceStatus() string {
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetPGServiceStatus: %v", r)
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
+			}
+		}
+	}()
+
+	// Konfigürasyonu yükle
+	cfg, err := config.LoadAgentConfig()
+	if err != nil {
+		log.Printf("Konfigürasyon yüklenemedi: %v", err)
+		return "FAIL!"
+	}
+
+	// PostgreSQL host ve port bilgilerini al
+	host := cfg.PostgreSQL.Host
+	if host == "" {
+		host = "localhost"
+	}
+
+	port := cfg.PostgreSQL.Port
+	if port == "" {
+		port = "5432" // varsayılan PostgreSQL portu
+	}
+
+	// TCP bağlantısı ile port kontrolü yap
+	address := fmt.Sprintf("%s:%s", host, port)
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		log.Printf("PostgreSQL at %s is not accessible: %v", address, err)
+		return "FAIL!"
+	}
+	if conn != nil {
+		conn.Close()
+	}
+
+	return "RUNNING"
+}
+
+// GetPGVersion PostgreSQL versiyonunu döndürür
+func GetPGVersion() string {
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetPGVersion: %v", r)
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
+			}
+		}
+	}()
+
+	db, err := openDBDirect() // Use direct connection for version check
+	if err != nil {
+		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
+		return "Unknown"
+	}
+	defer db.Close()
+
+	var version string
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = db.QueryRowContext(ctx, "SELECT version()").Scan(&version)
+	if err != nil {
+		log.Printf("Versiyon bilgisi alınamadı: %v", err)
+		return "Unknown"
+	}
+
+	// PostgreSQL 14.5 gibi sadece ana versiyon numarasını çıkar
+	re := regexp.MustCompile(`PostgreSQL (\d+\.\d+)`)
+	matches := re.FindStringSubmatch(version)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+
+	return "Unknown"
+}
+
+// GetNodeStatus node'un master/slave durumunu döndürür
+func GetNodeStatus() string {
+	// Comprehensive debug logging
+	logger.Debug("GetNodeStatus: Starting function")
+
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+	logger.Debug("GetNodeStatus: EnsureDefaultCollector completed")
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetNodeStatus: %v", r)
+			// Log detailed stack trace
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			logger.Error("GetNodeStatus STACK TRACE: %s", string(buf[:n]))
+
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
+				logger.Error("GetNodeStatus: Marked collector as unhealthy after panic")
+			} else {
+				logger.Error("GetNodeStatus: Collector is nil after panic!")
+			}
+		}
+	}()
+
+	// Check collector state
+	collector := GetDefaultCollectorSafe()
+	if collector == nil {
+		logger.Error("GetNodeStatus: Collector is nil, attempting re-initialization")
+		EnsureDefaultCollector()
+		collector = GetDefaultCollectorSafe()
+		if collector == nil {
+			logger.Error("GetNodeStatus: Collector still nil after re-initialization")
+			return "Unknown"
+		}
+	}
+	logger.Debug("GetNodeStatus: Collector state validated")
+
+	// Extra validation before DB connection
+	logger.Debug("GetNodeStatus: About to call openDBDirect")
+	db, err := openDBDirect() // Use direct connection for status check
+	if err != nil {
+		logger.Error("GetNodeStatus: Database connection failed: %v", err)
+		return "Unknown"
+	}
+	if db == nil {
+		logger.Error("GetNodeStatus: Database connection is nil")
+		return "Unknown"
+	}
+	defer func() {
+		logger.Debug("GetNodeStatus: Closing database connection")
+		if closeErr := db.Close(); closeErr != nil {
+			logger.Error("GetNodeStatus: Error closing DB: %v", closeErr)
+		}
+	}()
+	logger.Debug("GetNodeStatus: Database connection established")
+
+	// PostgreSQL 10 ve üzeri için
+	var inRecovery bool
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	logger.Debug("GetNodeStatus: About to execute pg_is_in_recovery query")
+	err = db.QueryRowContext(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery)
+	if err != nil {
+		logger.Error("GetNodeStatus: Query failed: %v", err)
+		return "Unknown"
+	}
+	logger.Debug("GetNodeStatus: Query completed, inRecovery=%v", inRecovery)
+
+	if inRecovery {
+		logger.Debug("GetNodeStatus: Returning SLAVE")
+		return "SLAVE"
+	}
+	logger.Debug("GetNodeStatus: Returning MASTER")
+	return "MASTER"
+}
+
+// openDBDirect creates a database connection without rate limiting for critical operations
+func openDBDirect() (*sql.DB, error) {
+	// Comprehensive debug logging
+	logger.Debug("openDBDirect: Starting function")
+
+	// Ensure collector is initialized with thread safety
+	EnsureDefaultCollector()
+	logger.Debug("openDBDirect: EnsureDefaultCollector completed")
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in openDBDirect: %v", r)
+			// Log detailed stack trace
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			logger.Error("openDBDirect STACK TRACE: %s", string(buf[:n]))
+
+			// Mark as unhealthy after panic - but check for nil first with thread safety
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
+				logger.Error("openDBDirect: Marked collector as unhealthy after panic")
+			} else {
+				logger.Error("openDBDirect: Collector is nil after panic!")
+			}
+		}
+	}()
+
+	logger.Debug("openDBDirect: About to load agent config")
+	cfg, err := config.LoadAgentConfig()
+	if err != nil {
+		logger.Error("openDBDirect: Config load failed: %v", err)
+		return nil, fmt.Errorf("konfigürasyon yüklenemedi: %v", err)
+	}
+	if cfg == nil {
+		logger.Error("openDBDirect: Config is nil")
+		return nil, fmt.Errorf("config is nil")
+	}
+	logger.Debug("openDBDirect: Config loaded successfully - Host: %s, Port: %s", cfg.PostgreSQL.Host, cfg.PostgreSQL.Port)
+
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable connect_timeout=5",
+		cfg.PostgreSQL.Host,
+		cfg.PostgreSQL.Port,
+		cfg.PostgreSQL.User,
+		cfg.PostgreSQL.Pass,
+		"postgres",
+	)
+	logger.Debug("openDBDirect: About to open database connection")
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		logger.Error("openDBDirect: sql.Open failed: %v", err)
+		return nil, err
+	}
+	if db == nil {
+		logger.Error("openDBDirect: sql.Open returned nil db")
+		return nil, fmt.Errorf("database connection is nil")
+	}
+	logger.Debug("openDBDirect: Database opened successfully")
+
+	// Set conservative limits
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(10 * time.Second)
+	logger.Debug("openDBDirect: Connection limits set")
+
+	// Test connection with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	logger.Debug("openDBDirect: About to test connection with ping")
+	err = db.PingContext(ctx)
+	if err != nil {
+		logger.Error("openDBDirect: Ping failed: %v", err)
+		db.Close()
+		return nil, fmt.Errorf("PostgreSQL direct connection test failed: %w", err)
+	}
+	logger.Debug("openDBDirect: Connection test successful")
+
+	return db, nil
+}
+
+// convertSize bytes cinsinden boyutu okunabilir formata çevirir
+func convertSize(bytes uint64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+
+	div, exp := uint64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// FindPostgresConfigFile PostgreSQL konfigürasyon dosyasını bulur
+func FindPostgresConfigFile() (string, error) {
+	// Olası konfigürasyon dosyası konumları
+	possiblePaths := []string{
+		"/etc/postgresql/*/main/postgresql.conf",
+		"/var/lib/pgsql/data/postgresql.conf",
+		"/var/lib/postgresql/*/main/postgresql.conf",
+		"/usr/local/var/postgresql*/postgresql.conf",
+		"/opt/homebrew/var/postgresql*/postgresql.conf", // macOS için
+	}
+
+	// Her bir olası yolu kontrol et
+	for _, pattern := range possiblePaths {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		if len(matches) > 0 {
+			return matches[0], nil
+		}
+	}
+
+	return "", fmt.Errorf("postgresql.conf dosyası bulunamadı")
+}
+
+// getDataDirectoryFromConfig postgresql.conf dosyasından data_directory parametresini okur
+func getDataDirectoryFromConfig() (string, error) {
+	configFile, err := FindPostgresConfigFile()
+	if err != nil {
+		return "", fmt.Errorf("konfigürasyon dosyası bulunamadı: %v", err)
+	}
+	log.Printf("Config file found at: %s", configFile)
+
+	content, err := os.ReadFile(configFile)
+	if err != nil {
+		return "", fmt.Errorf("konfigürasyon dosyası okunamadı: %v", err)
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		// Remove comments and trim whitespace
+		line = strings.Split(line, "#")[0]
+		line = strings.TrimSpace(line)
+
+		if strings.HasPrefix(line, "data_directory") {
+			// Split on = and handle any whitespace
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			// Clean up the value: remove quotes and whitespace
+			value := strings.Trim(strings.Trim(parts[1], " '\""), " ")
+			log.Printf("Found data_directory: %s", value) // Debug log
+			return value, nil
+		}
+	}
+
+	return "", fmt.Errorf("data_directory parametresi bulunamadı")
+}
+
+// GetDataDirectory postgresql.conf dosyasından data_directory parametresini okur (public wrapper)
+func GetDataDirectory() (string, error) {
+	return getDataDirectoryFromConfig()
+}
+
+// GetReplicationLagSec replication lag'i saniye cinsinden döndürür
+func GetReplicationLagSec() float64 {
+	// Ensure collector is initialized
+	EnsureDefaultCollector()
+
+	// Implement panic recovery to prevent crash
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in GetReplicationLagSec: %v", r)
+			// Mark as unhealthy after panic - thread-safe
+			if collector := GetDefaultCollectorSafe(); collector != nil {
+				collectorMutex.Lock()
+				collector.isHealthy = false
+				collector.collectionInterval = 5 * time.Minute
+				collectorMutex.Unlock()
+			}
+		}
+	}()
+
+	db, err := openDBDirect() // Use direct connection for lag check
+	if err != nil {
+		log.Printf("Veritabanı bağlantısı kurulamadı: %v", err)
+		return 0
+	}
+	defer db.Close()
+
+	nodeStatus := GetNodeStatus()
+	if nodeStatus != "SLAVE" {
+		return 0
+	}
+
+	var lag sql.NullFloat64 // Use NullFloat64 to handle NULL values
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = db.QueryRowContext(ctx, `
+		SELECT CASE 
+			WHEN pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn() 
+			THEN 0 
+			ELSE EXTRACT (EPOCH FROM now() - pg_last_xact_replay_timestamp()) 
+		END AS lag_delay
+	`).Scan(&lag)
+	if err != nil {
+		log.Printf("Replication lag alınamadı: %v", err)
+		return 0
+	}
+
+	// Handle NULL values properly
+	if !lag.Valid {
+		log.Printf("Replication lag NULL döndürüldü, 0 olarak işleniyor")
+		return 0
+	}
+
+	return lag.Float64
+}
+
+// GetPGBouncerStatus PgBouncer servisinin durumunu kontrol eder
+func GetPGBouncerStatus() string {
+	out, err := exec.Command("pgrep", "pgbouncer").Output()
+	if err != nil || len(out) == 0 {
+		log.Println("pgrep pgbouncer returns empty", out, err)
+		return "FAIL!"
+	}
+	return "RUNNING"
+}
+
+// GetSystemMetrics sistem metriklerini toplar
+func GetSystemMetrics() *pb.SystemMetrics {
+	// Unix/Linux/macOS sistemler için mevcut implementasyon
+	return getUnixSystemMetrics()
+}
+
+// getUnixSystemMetrics Unix tabanlı işletim sistemlerinden (Linux, macOS) sistem metriklerini toplar
+func getUnixSystemMetrics() *pb.SystemMetrics {
+	metrics := &pb.SystemMetrics{}
+
+	// CPU kullanımı ve çekirdek sayısı
+	if cpuPercent, err := utils.GetCPUUsage(); err == nil {
+		metrics.CpuUsage = cpuPercent
+	}
+	if cpuCores, err := getCPUCores(); err == nil {
+		metrics.CpuCores = cpuCores
+	}
+
+	// Load Average
+	if loadAvg, err := getLoadAverage(); err == nil {
+		metrics.LoadAverage_1M = loadAvg[0]
+		metrics.LoadAverage_5M = loadAvg[1]
+		metrics.LoadAverage_15M = loadAvg[2]
+	}
+
+	// RAM kullanımı
+	if ramUsage, err := getRAMUsage(); err == nil {
+		metrics.TotalMemory = ramUsage["total_mb"].(int64)
+		metrics.FreeMemory = ramUsage["free_mb"].(int64)
+		metrics.MemoryUsage = ramUsage["usage_percent"].(float64)
+	}
+
+	// Disk kullanımı
+	if diskUsage, err := getDiskUsage(); err == nil {
+		metrics.TotalDisk = diskUsage["total_gb"].(int64)
+		metrics.FreeDisk = diskUsage["avail_gb"].(int64)
+	}
+
+	// OS ve Kernel bilgileri
+	if osInfo, err := getOSInfo(); err == nil {
+		metrics.OsVersion = osInfo["os_version"]
+		metrics.KernelVersion = osInfo["kernel_version"]
+	}
+
+	// Uptime
+	if uptime, err := getUptime(); err == nil {
+		metrics.Uptime = uptime
+	}
+
+	return metrics
+}
+
+// getCPUCores CPU çekirdek sayısını döndürür
+func getCPUCores() (int32, error) {
+	// Linux sistemlerde nproc komutunu kullan
+	cmd := exec.Command("nproc")
+	out, err := cmd.Output()
+	if err != nil {
+		// Alternatif olarak /proc/cpuinfo'dan say
+		cmd = exec.Command("sh", "-c", "grep -c processor /proc/cpuinfo")
+		out, err = cmd.Output()
+		if err != nil {
+			return 0, err
+		}
+	}
+	cores, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	return int32(cores), nil
+}
+
+// getTotalvCpu sistemdeki toplam vCPU sayısını döndürür
+func GetTotalvCpu() int32 {
+	// UNIX/Linux sistemlerde nproc veya lscpu komutu kullanılabilir
+	cmd := exec.Command("sh", "-c", "nproc")
+	out, err := cmd.Output()
+	if err != nil {
+		// nproc çalışmadıysa, lscpu dene
+		cmd = exec.Command("sh", "-c", "lscpu | grep 'CPU(s):' | head -n 1 | awk '{print $2}'")
+		out, err = cmd.Output()
+		if err != nil {
+			// Hata varsa, getCPUCores'u kullan
+			cores, err := getCPUCores()
+			if err != nil {
+				log.Printf("vCPU sayısı alınamadı: %v", err)
+				return int32(1) // Default to 1 instead of 0
+			}
+			// Ensure result is valid
+			if cores <= 0 {
+				return int32(1)
+			}
+			return cores
+		}
+	}
+
+	// Çıktıyı int32'ye çevir
+	cpuCount, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 32)
+	if err != nil {
+		log.Printf("vCPU sayısı parse edilemedi: %v", err)
+		return int32(1) // Default to 1 instead of 0
+	}
+
+	// Ensure result is valid and within reasonable range
+	if cpuCount <= 0 {
+		log.Printf("Invalid CPU count detected: %d, using default", cpuCount)
+		return int32(1)
+	}
+	if cpuCount > 256 { // Reasonable upper limit
+		log.Printf("CPU count seems too high: %d, capping at 256", cpuCount)
+		return int32(256)
+	}
+
+	return int32(cpuCount)
+}
+
+// getTotalMemory sistemdeki toplam RAM miktarını byte cinsinden döndürür
+func GetTotalMemory() int64 {
+	// Linux sistemlerde /proc/meminfo dosyasından MemTotal değerini okuyabiliriz
+	cmd := exec.Command("sh", "-c", "grep MemTotal /proc/meminfo | awk '{print $2}'")
+	out, err := cmd.Output()
+	if err != nil {
+		// Alternatif olarak free komutu deneyelim
+		cmd = exec.Command("sh", "-c", "free -b | grep 'Mem:' | awk '{print $2}'")
+		out, err = cmd.Output()
+		if err != nil {
+			// MacOS için sysctl'yi deneyelim
+			cmd = exec.Command("sh", "-c", "sysctl -n hw.memsize")
+			out, err = cmd.Output()
+			if err != nil {
+				log.Printf("Toplam RAM miktarı alınamadı: %v", err)
+				return int64(8 * 1024 * 1024 * 1024) // Default to 8GB
+			}
+		}
+	}
+
+	// Parse as int64 to avoid scientific notation
+	memTotal, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		log.Printf("Toplam RAM miktarı parse edilemedi: %v", err)
+		return int64(8 * 1024 * 1024 * 1024) // Default to 8GB
+	}
+
+	// grep MemTotal kullanıldıysa KB cinsinden, bunu byte'a çevir
+	if strings.Contains(cmd.String(), "MemTotal") {
+		memTotal *= 1024
+	}
+
+	// Ensure result is valid and within reasonable range
+	if memTotal <= 0 {
+		log.Printf("Invalid memory size detected: %d, using default 8GB", memTotal)
+		return int64(8 * 1024 * 1024 * 1024)
+	}
+
+	// Reasonable upper limit check (1TB)
+	maxMemory := int64(1024 * 1024 * 1024 * 1024)
+	if memTotal > maxMemory {
+		log.Printf("Memory size seems too high: %d, capping at 1TB", memTotal)
+		return maxMemory
+	}
+
+	// Log memory value to verify no scientific notation
+	log.Printf("POSTGRES MEMORY COLLECTED - Value: %d bytes (format check: %d)",
+		memTotal, memTotal)
+
+	return memTotal
+}
+
+// getLoadAverage sistem yükünü döndürür
+func getLoadAverage() ([]float64, error) {
+	// Linux sistemlerde /proc/loadavg dosyasını oku
+	content, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return nil, err
+	}
+
+	// Çıktı formatı: "0.00 0.00 0.00 ..."
+	fields := strings.Fields(string(content))
+	if len(fields) < 3 {
+		return nil, fmt.Errorf("unexpected loadavg format: %s", content)
+	}
+
+	loads := make([]float64, 3)
+	for i := 0; i < 3; i++ {
+		load, err := strconv.ParseFloat(fields[i], 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse load value: %s", fields[i])
+		}
+		loads[i] = load
+	}
+	return loads, nil
+}
+
+// getRAMUsage RAM kullanım bilgilerini döndürür
+func getRAMUsage() (map[string]interface{}, error) {
+	// Toplam RAM miktarını al
+	cmd := exec.Command("sh", "-c", "sysctl -n hw.memsize")
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("failed to get total memory with hw.memsize: %v", err)
+		// Alternatif yöntem - top komutunu kullan
+		return getRAMUsageWithTop()
+	}
+
+	totalBytes, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		log.Printf("failed to parse total memory: %v", err)
+		return getRAMUsageWithTop()
+	}
+	totalMB := totalBytes / (1024 * 1024)
+
+	// MacOS'da farklı bir yaklaşım deneyelim - vm_stat kullanarak
+	cmd = exec.Command("sh", "-c", "vm_stat | grep 'Pages free\\|Pages active\\|Pages inactive\\|Pages speculative\\|Pages wired down'")
+	out, err = cmd.Output()
+	if err != nil {
+		log.Printf("failed to get memory stats with vm_stat: %v", err)
+		return getRAMUsageWithTop()
+	}
+
+	// Çıktıyı işle
+	vmStatLines := strings.Split(string(out), "\n")
+
+	// Sayfa boyutunu al
+	cmd = exec.Command("sh", "-c", "sysctl -n hw.pagesize")
+	out, err = cmd.Output()
+	if err != nil {
+		log.Printf("failed to get page size: %v", err)
+		return getRAMUsageWithTop()
+	}
+
+	pageSize, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		log.Printf("failed to parse page size: %v", err)
+		return getRAMUsageWithTop()
+	}
+
+	var freePages, activePages, inactivePages, speculativePages, wiredPages uint64
+
+	// vm_stat çıktısını parse et
+	for _, line := range vmStatLines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Split(line, ":")
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := strings.TrimSpace(parts[0])
+		valueStr := strings.TrimSpace(parts[1])
+		valueStr = strings.ReplaceAll(valueStr, ".", "") // Nokta karakterini kaldır
+		value, err := strconv.ParseUint(valueStr, 10, 64)
+		if err != nil {
+			log.Printf("failed to parse vm_stat value for %s: %v", key, err)
+			continue
+		}
+
+		switch {
+		case strings.Contains(key, "Pages free"):
+			freePages = value
+		case strings.Contains(key, "Pages active"):
+			activePages = value
+		case strings.Contains(key, "Pages inactive"):
+			inactivePages = value
+		case strings.Contains(key, "Pages speculative"):
+			speculativePages = value
+		case strings.Contains(key, "Pages wired down"):
+			wiredPages = value
+		}
+	}
+
+	log.Printf("VM_STAT Parse - Free: %d, Active: %d, Inactive: %d, Speculative: %d, Wired: %d",
+		freePages, activePages, inactivePages, speculativePages, wiredPages)
+
+	// Kullanılan sayfaları hesapla
+	usedPages := activePages + wiredPages
+	usedBytes := usedPages * pageSize
+	usedMB := usedBytes / (1024 * 1024)
+
+	freeMB := (freePages * pageSize) / (1024 * 1024)
+
+	// Eğer değerler sıfırsa, yaklaşık değerler kullan
+	if totalMB == 0 || usedMB == 0 || freeMB == 0 {
+		log.Printf("UYARI: Bellek hesaplamaları sıfır değerler içeriyor, top ile deneniyor")
+		return getRAMUsageWithTop()
+	}
+
+	// Kullanım yüzdesini hesapla
+	usagePercent := (float64(usedMB) / float64(totalMB)) * 100
+
+	// Debug log
+	log.Printf("RAM Debug - Page Size: %d, Total MB: %d, Used MB: %d, Free MB: %d, Usage: %.2f%%",
+		pageSize, totalMB, usedMB, freeMB, usagePercent)
+
+	return map[string]interface{}{
+		"total_mb":      int64(totalMB),
+		"used_mb":       int64(usedMB),
+		"free_mb":       int64(freeMB),
+		"usage_percent": usagePercent,
+	}, nil
+}
+
+// getRAMUsageWithTop top komutunu kullanarak RAM kullanımını alır
+func getRAMUsageWithTop() (map[string]interface{}, error) {
+	log.Printf("top komutu ile bellek kullanımı alınıyor...")
+
+	// top komutunu kullanarak bellek bilgisi al
+	cmd := exec.Command("sh", "-c", "top -l 1 -n 0 | grep PhysMem")
+	out, err := cmd.Output()
+	if err != nil {
+		return map[string]interface{}{
+			"total_mb":      int64(16384), // 16GB varsayılan değer
+			"free_mb":       int64(4096),  // 4GB varsayılan değer
+			"used_mb":       int64(12288), // 12GB varsayılan değer
+			"usage_percent": 75.0,         // %75 varsayılan kullanım
+		}, nil
+	}
+
+	topOutput := strings.TrimSpace(string(out))
+	log.Printf("TOP output: %s", topOutput)
+
+	// PhysMem: 10G used (1.8G wired), 6.1G unused.
+	// Bu formatı parse et
+
+	reUsed := regexp.MustCompile(`(\d+(?:\.\d+)?)G used`)
+	reUnused := regexp.MustCompile(`(\d+(?:\.\d+)?)G unused`)
+
+	var usedGB, unusedGB float64
+
+	if matches := reUsed.FindStringSubmatch(topOutput); len(matches) > 1 {
+		usedGB, _ = strconv.ParseFloat(matches[1], 64)
+	}
+
+	if matches := reUnused.FindStringSubmatch(topOutput); len(matches) > 1 {
+		unusedGB, _ = strconv.ParseFloat(matches[1], 64)
+	}
+
+	// GB'den MB'ye çevir
+	usedMB := int64(usedGB * 1024)
+	unusedMB := int64(unusedGB * 1024)
+	totalMB := usedMB + unusedMB
+
+	// Kullanım yüzdesini hesapla
+	var usagePercent float64
+	if totalMB > 0 {
+		usagePercent = (float64(usedMB) / float64(totalMB)) * 100
+	} else {
+		usagePercent = 75.0 // Varsayılan değer
+	}
+
+	log.Printf("TOP Parse - Total MB: %d, Used MB: %d, Unused MB: %d, Usage: %.2f%%",
+		totalMB, usedMB, unusedMB, usagePercent)
+
+	// Eğer değerler hala sıfırsa, varsayılan değerler kullan
+	if totalMB == 0 || usedMB == 0 || unusedMB == 0 {
+		log.Printf("UYARI: TOP ile bellek hesaplamaları başarısız, varsayılan değerler kullanılıyor")
+		return map[string]interface{}{
+			"total_mb":      int64(16384), // 16GB
+			"free_mb":       int64(4096),  // 4GB
+			"used_mb":       int64(12288), // 12GB
+			"usage_percent": 75.0,         // %75
+		}, nil
+	}
+
+	return map[string]interface{}{
+		"total_mb":      totalMB,
+		"used_mb":       usedMB,
+		"free_mb":       unusedMB,
+		"usage_percent": usagePercent,
+	}, nil
+}
+
+// getDiskUsage disk kullanım bilgilerini döndürür
+func getDiskUsage() (map[string]interface{}, error) {
+	// GetDiskUsage metodunu kullanarak detaylı bilgi al
+	freeDisk, usagePercent, totalDisk, filesystem, mountPoint := GetDiskUsage()
+	// PostgreSQL GetDiskUsage signature: (freeDisk string, percent int, totalDisk string, filesystem string, mountPoint string)
+	log.Printf("DEBUG: PostgreSQL getDiskUsage - GetDiskUsage() returned: free=%s, usage=%d%%, total=%s, filesystem=%s, mountPoint=%s",
+		freeDisk, usagePercent, totalDisk, filesystem, mountPoint)
+	
+	if freeDisk == "N/A" || totalDisk == "N/A" {
+		return map[string]interface{}{
+			"total_gb": int64(0),
+			"avail_gb": int64(0),
+			"filesystem": "N/A",
+			"mount_point": "N/A",
+			"usage_percent": 0,
+		}, nil
+	}
+
+	// Convert disk sizes to bytes
+	totalBytes, err := convertToBytes(totalDisk)
+	log.Printf("DEBUG: PostgreSQL getDiskUsage - convertToBytes('%s') returned: %d bytes, error: %v", totalDisk, totalBytes, err)
+	if err != nil {
+		log.Printf("DEBUG: PostgreSQL getDiskUsage - Failed to parse total disk '%s': %v", totalDisk, err)
+		return map[string]interface{}{
+			"total_gb": int64(0),
+			"avail_gb": int64(0),
+			"filesystem": filesystem,
+			"mount_point": mountPoint,
+			"usage_percent": usagePercent,
+		}, nil
+	}
+	
+	freeBytes, err := convertToBytes(freeDisk)
+	if err != nil {
+		log.Printf("DEBUG: PostgreSQL getDiskUsage - Failed to parse free disk '%s': %v", freeDisk, err)
+		return map[string]interface{}{
+			"total_gb": int64(0),
+			"avail_gb": int64(0),
+			"filesystem": filesystem,
+			"mount_point": mountPoint,
+			"usage_percent": usagePercent,
+		}, nil
+	}
+
+	// Convert to GB
+	totalGB := int64(totalBytes / (1024 * 1024 * 1024))
+	availGB := int64(freeBytes / (1024 * 1024 * 1024))
+	
+	log.Printf("DEBUG: PostgreSQL getDiskUsage - FINAL VALUES: total_gb=%d, avail_gb=%d, total_bytes=%d, avail_bytes=%d, filesystem=%s, mount_point=%s, usage_percent=%d",
+		totalGB, availGB, totalBytes, freeBytes, filesystem, mountPoint, usagePercent)
+	
+	return map[string]interface{}{
+		"total_gb": totalGB,
+		"avail_gb": availGB,
+		"filesystem": filesystem,
+		"mount_point": mountPoint,
+		"usage_percent": usagePercent,
+	}, nil
+}
+
+// getOSInfo işletim sistemi ve kernel bilgilerini döndürür
+func getOSInfo() (map[string]string, error) {
+	osInfo := make(map[string]string)
+
+	// OS versiyonu için /etc/os-release dosyasını oku
+	content, err := os.ReadFile("/etc/os-release")
+	if err == nil {
+		lines := strings.Split(string(content), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "VERSION=") || strings.HasPrefix(line, "VERSION_ID=") {
+				version := strings.Trim(strings.SplitN(line, "=", 2)[1], "\"")
+				osInfo["os_version"] = version
+				break
+			}
+		}
+	}
+
+	// Kernel versiyonu
+	cmd := exec.Command("uname", "-r")
+	if out, err := cmd.Output(); err == nil {
+		kernelVersion := strings.TrimSpace(string(out))
+		osInfo["kernel_version"] = kernelVersion
+	}
+
+	// Eğer os_version alınamadıysa, alternatif yöntem dene
+	if _, exists := osInfo["os_version"]; !exists {
+		if _, err := os.Stat("/etc/redhat-release"); err == nil {
+			// CentOS/RHEL için
+			content, err := os.ReadFile("/etc/redhat-release")
+			if err == nil {
+				osInfo["os_version"] = strings.TrimSpace(string(content))
+			}
+		} else {
+			// Debian/Ubuntu için
+			cmd := exec.Command("lsb_release", "-d")
+			if out, err := cmd.Output(); err == nil {
+				desc := strings.TrimSpace(string(out))
+				if strings.HasPrefix(desc, "Description:") {
+					osInfo["os_version"] = strings.TrimSpace(strings.TrimPrefix(desc, "Description:"))
+				}
+			}
+		}
+	}
+
+	return osInfo, nil
+}
+
+// getUptime sistemin çalışma süresini saniye cinsinden döndürür
+func getUptime() (int64, error) {
+	// Linux sistemlerde /proc/uptime dosyasını oku
+	content, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0, err
+	}
+
+	// İlk alan uptime değeridir (saniye cinsinden)
+	uptime := strings.Fields(string(content))[0]
+	uptimeFloat, err := strconv.ParseFloat(uptime, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return int64(uptimeFloat), nil
+}
+
+// isMatchingPostgresLogName dosya adının PostgreSQL log dosyası kalıbına uyup uymadığını kontrol eder
+func isMatchingPostgresLogName(fileName string) bool {
+	// PostgreSQL log dosyası adı kalıpları
+	patterns := []string{
+		"postgresql",
+		"postgres",
+		"pg_log",
+		"pglog",
+		"pgsql",
+	}
+
+	lowerName := strings.ToLower(fileName)
+
+	// Dosya adı kalıplarını kontrol et
+	for _, pattern := range patterns {
+		if strings.HasPrefix(lowerName, pattern) {
+			return true
+		}
+	}
+
+	// Tarih formatı içeren log dosyaları kontrolü (postgresql-2023-06-01.log gibi)
+	postgresLogPattern := regexp.MustCompile(`(postgres|postgresql|pg_log|pglog).*\d{4}[-_]\d{2}[-_]\d{2}`)
+	if postgresLogPattern.MatchString(lowerName) {
+		return true
+	}
+
+	return false
+}
+
+// isPostgresArtifact bir dosyanın PostgreSQL log dosyası olup olmadığını kontrol eder
+func isPostgresArtifact(name string) bool {
+	// Dosya adını küçük harfe çevir
+	nameLower := strings.ToLower(name)
+
+	// 1. Dosya uzantısı kontrolü
+	if !strings.HasSuffix(nameLower, ".log") &&
+		!strings.HasSuffix(nameLower, ".csv") &&
+		!strings.HasSuffix(nameLower, ".log.gz") {
+		return false
+	}
+
+	// 2. PostgreSQL ile ilgili anahtar kelimeler kontrolü
+	if !isMatchingPostgresLogName(nameLower) {
+		return false
+	}
+
+	return true
+}
+
+// FindPostgresLogFiles PostgreSQL log dosyalarını bulur ve listeler
+func FindPostgresLogFiles(logPath string) ([]*pb.PostgresLogFile, error) {
+	// PostgreSQL çalışıyor mu kontrol et
+	pgRunning := isPgRunning()
+	if !pgRunning {
+		return nil, fmt.Errorf("PostgreSQL servisi çalışmıyor, log dosyaları listelenemedi")
+	}
+
+	// Eğer logPath belirtilmemişse, varsayılan olarak bilinen lokasyonları kontrol et
+	if logPath == "" {
+		// PostgreSQL konfigürasyon dosyasını bul
+		configFile, err := FindPostgresConfigFile()
+		if err == nil {
+			// Konfigürasyondan log path'i oku
+			if path := getLogPathFromConfig(configFile); path != "" {
+				logPath = path
+				log.Printf("PostgreSQL log dizini konfigürasyon dosyasından bulundu: %s", path)
+			}
+		}
+
+		// Hala log path bulunamadıysa, bilinen dizinleri kontrol et
+		if logPath == "" {
+			// Bilinen olası PostgreSQL log dizinleri
+			logDirs := []string{
+				"/var/log/postgresql",
+				"/var/log/postgres",
+				"/var/lib/postgresql/*/main/pg_log",
+				"/var/lib/postgresql/*/log",
+				"/var/lib/pgsql/data/log",
+				"/var/lib/pgsql/data/pg_log",
+				"/usr/local/var/postgres/log",
+				"/usr/local/var/postgres/pg_log",
+				"/usr/local/pgsql/data/pg_log",
+				"/usr/local/pgsql/data/log",
+				"/opt/homebrew/var/postgres/log", // macOS Homebrew Apple Silicon
+				"/usr/local/var/log/postgresql",
+				"/data/postgres/*/log",
+				"/data/postgres/*/pg_log",
+			}
+
+			// PostgreSQL veri dizinini bulmayı dene
+			dataDir, err := getDataDirectoryFromConfig()
+			if err == nil && dataDir != "" {
+				// Data dizinindeki log dizinini kontrol et
+				logDirs = append([]string{
+					filepath.Join(dataDir, "log"),
+					filepath.Join(dataDir, "pg_log"),
+					filepath.Join(dataDir, "logs"),
+				}, logDirs...)
+				log.Printf("PostgreSQL veri dizini bulundu, log için kontrol ediliyor: %s/{log,pg_log,logs}", dataDir)
+			}
+
+			// İlk bulunan geçerli dizini kullan
+			for _, dirPattern := range logDirs {
+				// Glob pattern'ı destekle
+				matches, err := filepath.Glob(dirPattern)
+				if err != nil || len(matches) == 0 {
+					continue
+				}
+
+				for _, dir := range matches {
+					if _, err := os.Stat(dir); err == nil {
+						logPath = dir
+						log.Printf("PostgreSQL log dizini bulundu: %s", logPath)
+						break
+					}
+				}
+				if logPath != "" {
+					break
+				}
+			}
+		}
+	}
+
+	if logPath == "" {
+		return nil, fmt.Errorf("PostgreSQL log dizini bulunamadı")
+	}
+
+	// logPath'in var olup olmadığını kontrol et
+	info, err := os.Stat(logPath)
+	if err != nil {
+		return nil, fmt.Errorf("belirtilen log dizini bulunamadı: %v", err)
+	}
+
+	var logFiles []*pb.PostgresLogFile
+
+	// Eğer belirtilen path bir dosya ise ve PostgreSQL log dosyası ise, direkt olarak onu ekle
+	if !info.IsDir() {
+		if isPostgresArtifact(filepath.Base(logPath)) {
+			file := &pb.PostgresLogFile{
+				Name:         filepath.Base(logPath),
+				Path:         logPath,
+				Size:         info.Size(),
+				LastModified: info.ModTime().Unix(),
+			}
+			return []*pb.PostgresLogFile{file}, nil
+		}
+		return nil, fmt.Errorf("belirtilen dosya bir PostgreSQL log dosyası değil: %s", logPath)
+	}
+
+	// Dizindeki tüm dosyaları listele
+	entries, err := os.ReadDir(logPath)
+	if err != nil {
+		return nil, fmt.Errorf("dizin içeriği listelenemedi: %v", err)
+	}
+
+	// Her bir dosyayı kontrol et
+	for _, entry := range entries {
+		// Sadece dosyaları işle
+		if entry.IsDir() {
+			continue
+		}
+
+		fileName := entry.Name()
+		if isPostgresArtifact(fileName) {
+			fileInfo, err := os.Stat(filepath.Join(logPath, fileName))
+			if err != nil {
+				log.Printf("Dosya bilgileri alınamadı: %v", err)
+				continue
+			}
+
+			file := &pb.PostgresLogFile{
+				Name:         fileName,
+				Path:         filepath.Join(logPath, fileName),
+				Size:         fileInfo.Size(),
+				LastModified: fileInfo.ModTime().Unix(),
+			}
+			logFiles = append(logFiles, file)
+			log.Printf("PostgreSQL log dosyası bulundu: %s", file.Path)
+		}
+	}
+
+	if len(logFiles) == 0 {
+		log.Printf("Belirtilen dizinde (%s) PostgreSQL log dosyası bulunamadı", logPath)
+	} else {
+		log.Printf("%d adet PostgreSQL log dosyası bulundu", len(logFiles))
+	}
+
+	return logFiles, nil
+}
+
+// isPgRunning PostgreSQL servisinin çalışıp çalışmadığını kontrol eder
+func isPgRunning() bool {
+	cmd := exec.Command("pgrep", "postgres")
+	err := cmd.Run()
+	return err == nil
+}
+
+// findPostgresLogPathFromProcess PostgreSQL process'inden log dosyası yolunu bulmayı dener
+func findPostgresLogPathFromProcess() string {
+	// 1. ps ile tüm PostgreSQL süreçlerini bul
+	cmd := exec.Command("sh", "-c", "ps -ef | grep postgres | grep -v grep")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		// -D parametresinden sonra data directory'yi bul
+		if idx := strings.Index(line, "-D"); idx != -1 {
+			parts := strings.Fields(line[idx:])
+			if len(parts) > 1 {
+				dataDir := parts[1]
+				// Data directory içinde log ve pg_log dizinlerini kontrol et
+				for _, logDir := range []string{"log", "pg_log", "logs"} {
+					fullPath := filepath.Join(dataDir, logDir)
+					if _, err := os.Stat(fullPath); err == nil {
+						return fullPath
+					}
+				}
+			}
+		}
+
+		// -l veya --log parametresini ara
+		if idx := strings.Index(line, "-l "); idx != -1 || strings.Index(line, "--log=") != -1 {
+			parts := strings.Fields(line[idx:])
+			if len(parts) > 0 {
+				logArg := parts[0]
+				if strings.Contains(logArg, "=") {
+					parts = strings.Split(logArg, "=")
+					if len(parts) > 1 {
+						return strings.TrimSpace(parts[1])
+					}
+				} else if len(parts) > 1 {
+					return strings.TrimSpace(parts[1])
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+// findLogFileFromOpenFD açık dosya tanımlayıcılarını kontrol ederek PostgreSQL log dosyalarını bulmayı dener
+func findLogFileFromOpenFD() string {
+	// PostgreSQL PID'sini bul
+	cmd := exec.Command("sh", "-c", "pgrep postgres")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	pid := strings.TrimSpace(string(out))
+	if pid == "" {
+		return ""
+	}
+
+	// lsof ile açık dosyaları listele
+	cmd = exec.Command("sh", "-c", fmt.Sprintf("lsof -p %s | grep -i -E '(log|postgres)'", pid))
+	out, err = cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 9 {
+			filePath := fields[8]
+			// Dosya yolunu kontrol et
+			if strings.Contains(strings.ToLower(filePath), "postgres") && (strings.HasSuffix(strings.ToLower(filePath), ".log") ||
+				strings.Contains(strings.ToLower(filePath), "pg_log") ||
+				strings.Contains(strings.ToLower(filePath), "postgresql")) {
+				return filePath
+			}
+		}
+	}
+
+	return ""
+}
+
+// isPostgresLogFile dosya içeriğini kontrol ederek PostgreSQL log formatına uygun olup olmadığını belirler
+func isPostgresLogFile(filePath string) bool {
+	// Dosyanın ilk birkaç satırını oku
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	linesChecked := 0
+	for scanner.Scan() && linesChecked < 5 {
+		line := scanner.Text()
+		// PostgreSQL log satırları genellikle tarih formatı ve bazı anahtar kelimeler içerir
+		if strings.Contains(line, "postgres") ||
+			strings.Contains(line, "postgresql") ||
+			strings.Contains(line, "LOG:") ||
+			strings.Contains(line, "ERROR:") ||
+			strings.Contains(line, "FATAL:") ||
+			strings.Contains(line, "WARNING:") ||
+			strings.Contains(line, "HINT:") ||
+			strings.Contains(line, "STATEMENT:") {
+			return true
+		}
+		linesChecked++
+	}
+
+	return false
+}
+
+// checkPostgresFileDescriptors açık dosya tanımlayıcılarını kontrol ederek PostgreSQL log dosyalarını bulmayı dener
+func checkPostgresFileDescriptors() string {
+	// PostgreSQL PID'sini bul
+	cmd := exec.Command("sh", "-c", "pgrep postgres")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	pid := strings.TrimSpace(string(out))
+	if pid == "" {
+		return ""
+	}
+
+	// lsof ile açık dosyaları listele
+	cmd = exec.Command("sh", "-c", fmt.Sprintf("lsof -p %s | grep -i 'log'", pid))
+	out, err = cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 9 {
+			filePath := fields[8]
+			// Dosya yolunu kontrol et
+			if strings.HasSuffix(strings.ToLower(filePath), ".log") {
+				return filePath
+			}
+		}
+	}
+
+	return ""
+}
+
+// getLogPathFromConfig postgresql.conf dosyasından log_directory ve log_filename parametrelerini okur
+func getLogPathFromConfig(configFile string) string {
+	content, err := os.ReadFile(configFile)
+	if err != nil {
+		log.Printf("Konfigürasyon dosyası okunamadı: %v", err)
+		return ""
+	}
+
+	lines := strings.Split(string(content), "\n")
+
+	var logDirectory string
+
+	for _, line := range lines {
+		// Yorumları kaldır ve boşlukları temizle
+		line = strings.Split(line, "#")[0]
+		line = strings.TrimSpace(line)
+
+		if strings.HasPrefix(line, "log_directory") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				logDirectory = strings.Trim(strings.TrimSpace(parts[1]), "'\"")
+				break
+			}
+		}
+	}
+
+	// Sadece log_directory bulundu ise
+	if logDirectory != "" {
+		if strings.HasPrefix(logDirectory, "/") {
+			// Mutlak yol
+			return logDirectory
+		} else {
+			// Göreceli yol, data directory ile birleştir
+			dataDir, err := getDataDirectoryFromConfig()
+			if err == nil && dataDir != "" {
+				return filepath.Join(dataDir, logDirectory)
+			}
+		}
+	}
+
+	return ""
+}
+
+// ReadPostgresConfig belirtilen dosya yolundaki PostgreSQL konfigürasyon dosyasını okur ve
+// belirtilen parametrelerin değerlerini döndürür
+func ReadPostgresConfig(configPath string) ([]*pb.PostgresConfigEntry, error) {
+	// Konfigürasyon dosyasını oku
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("konfigürasyon dosyası okunamadı: %v", err)
+	}
+
+	// İzlenecek parametreler
+	targetParams := map[string]string{
+		"max_connections":                  "Maximum number of concurrent connections",
+		"shared_buffers":                   "Shared memory buffer size used by PostgreSQL",
+		"effective_cache_size":             "Amount of memory available for disk caching",
+		"maintenance_work_mem":             "Memory allocated for maintenance operations",
+		"checkpoint_completion_target":     "Target completion time for checkpoint operations",
+		"wal_buffers":                      "Memory allocated for WAL operations",
+		"default_statistics_target":        "Default statistics target for table columns",
+		"random_page_cost":                 "Cost estimate for random disk page access",
+		"effective_io_concurrency":         "Effective I/O concurrency for disk operations",
+		"work_mem":                         "Memory allocated for query operations",
+		"huge_pages":                       "Use of huge memory pages",
+		"min_wal_size":                     "Minimum size of WAL files",
+		"max_wal_size":                     "Maximum size of WAL files",
+		"max_worker_processes":             "Maximum number of background worker processes",
+		"max_parallel_workers_per_gather":  "Maximum parallel workers per Gather operation",
+		"max_parallel_workers":             "Maximum number of parallel workers",
+		"max_parallel_maintenance_workers": "Maximum parallel workers for maintenance operations",
+	}
+
+	// Kategoriler - parametreleri gruplandırmak için
+	paramCategories := map[string]string{
+		"max_connections":                  "Connection",
+		"shared_buffers":                   "Memory",
+		"effective_cache_size":             "Memory",
+		"maintenance_work_mem":             "Memory",
+		"checkpoint_completion_target":     "WAL",
+		"wal_buffers":                      "WAL",
+		"default_statistics_target":        "Query Planning",
+		"random_page_cost":                 "Query Planning",
+		"effective_io_concurrency":         "Query Planning",
+		"work_mem":                         "Memory",
+		"huge_pages":                       "Memory",
+		"min_wal_size":                     "WAL",
+		"max_wal_size":                     "WAL",
+		"max_worker_processes":             "Parallelism",
+		"max_parallel_workers_per_gather":  "Parallelism",
+		"max_parallel_workers":             "Parallelism",
+		"max_parallel_maintenance_workers": "Parallelism",
+	}
+
+	lines := strings.Split(string(content), "\n")
+	var configs []*pb.PostgresConfigEntry
+
+	// Bulunan parametreleri izlemek için bir harita
+	foundParams := make(map[string]bool)
+
+	// Her satırı işle
+	for _, line := range lines {
+		isCommented := false
+
+		// Yorum satırı mı kontrol et
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			// Satır yorumlanmış, # işaretini kaldır
+			line = strings.TrimSpace(line[1:])
+			isCommented = true
+		}
+
+		// Boş satırları atla
+		if len(strings.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		// Parametre ve değeri ayır
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		param := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+
+		// Parametre hedeflenen listede mi kontrol et
+		if desc, ok := targetParams[param]; ok {
+			// Bu parametreyi işaretleyelim
+			foundParams[param] = true
+
+			// Değeri düzenle - tırnak işaretleri veya son noktalı virgülü kaldır
+			value = strings.Trim(value, "'\"")
+			value = strings.TrimSuffix(value, ";")
+
+			// PostgresConfigEntry oluştur
+			category := paramCategories[param]
+			if category == "" {
+				category = "Other"
+			}
+
+			configEntry := &pb.PostgresConfigEntry{
+				Parameter:   param,
+				Value:       value,
+				Description: desc,
+				IsDefault:   isCommented, // Yorum satırı ise varsayılan değer olarak işaretleyelim
+				Category:    category,
+			}
+
+			configs = append(configs, configEntry)
+			log.Printf("Konfigürasyon parametresi bulundu: %s = %s (Yorumlanmış: %t)", param, value, isCommented)
+		}
+	}
+
+	// İstenen tüm parametreleri bulduk mu kontrol edelim
+	for param := range targetParams {
+		if !foundParams[param] {
+			log.Printf("UYARI: '%s' parametresi config dosyasında bulunamadı", param)
+		}
+	}
+
+	return configs, nil
+}
+
+// AnalyzePostgresLog PostgreSQL log dosyasını analiz eder
+
+// BatchCollectSystemMetrics collects various system metrics including response time
+func (c *PostgresCollector) BatchCollectSystemMetrics() map[string]interface{} {
+	log.Printf("DEBUG: PostgreSQL BatchCollectSystemMetrics - Starting system metrics collection")
+
+	metrics := make(map[string]interface{})
+
+	// CPU Metrics
+	cpuCores := GetTotalvCpu()
+	metrics["cpu_count"] = cpuCores
+	log.Printf("DEBUG: PostgreSQL - CPU cores: %d", cpuCores)
+
+	// Get CPU usage
+	if cpuUsage, err := utils.GetCPUUsage(); err == nil {
+		metrics["cpu_usage"] = cpuUsage
+		log.Printf("DEBUG: PostgreSQL - CPU usage: %.2f%%", cpuUsage)
+	} else {
+		log.Printf("DEBUG: PostgreSQL - Failed to get CPU usage: %v", err)
+		metrics["cpu_usage"] = float64(0)
+	}
+
+	// Memory Metrics
+	totalMemory := GetTotalMemory()
+	metrics["total_memory"] = totalMemory
+	log.Printf("DEBUG: PostgreSQL - Total memory: %d bytes", totalMemory)
+
+	// Get memory usage
+	if ramInfo, err := getRAMUsage(); err == nil {
+		if usedPercent, ok := ramInfo["used_percent"].(float64); ok {
+			metrics["memory_usage"] = usedPercent
+			log.Printf("DEBUG: PostgreSQL - Memory usage: %.2f%%", usedPercent)
+		}
+		if free, ok := ramInfo["free"].(int64); ok {
+			metrics["free_memory"] = free
+			log.Printf("DEBUG: PostgreSQL - Free memory: %d bytes", free)
+		} else if freeFloat, ok := ramInfo["free"].(float64); ok {
+			metrics["free_memory"] = int64(freeFloat)
+			log.Printf("DEBUG: PostgreSQL - Free memory: %d bytes (converted from float)", int64(freeFloat))
+		} else {
+			// Calculate free memory from total and used
+			if usedPercent, ok := ramInfo["used_percent"].(float64); ok {
+				freeMemory := int64(float64(totalMemory) * (100 - usedPercent) / 100)
+				metrics["free_memory"] = freeMemory
+				log.Printf("DEBUG: PostgreSQL - Free memory calculated: %d bytes", freeMemory)
+			} else {
+				metrics["free_memory"] = int64(0)
+			}
+		}
+	} else {
+		log.Printf("DEBUG: PostgreSQL - Failed to get RAM usage: %v", err)
+		metrics["memory_usage"] = float64(0)
+		metrics["free_memory"] = int64(0)
+	}
+
+	// Disk Metrics
+	if diskInfo, err := getDiskUsage(); err == nil {
+		if totalGB, ok := diskInfo["total_gb"].(int64); ok {
+			metrics["total_disk"] = totalGB * 1024 * 1024 * 1024 // Convert GB to bytes
+			log.Printf("DEBUG: PostgreSQL - Total disk: %d GB -> %d bytes", totalGB, totalGB*1024*1024*1024)
+		} else {
+			metrics["total_disk"] = int64(0)
+		}
+
+		if availGB, ok := diskInfo["avail_gb"].(int64); ok {
+			metrics["free_disk"] = availGB * 1024 * 1024 * 1024 // Convert GB to bytes
+			log.Printf("DEBUG: PostgreSQL - Free disk: %d GB -> %d bytes", availGB, availGB*1024*1024*1024)
+		} else {
+			metrics["free_disk"] = int64(0)
+		}
+
+		// Add new disk fields
+		if filesystem, ok := diskInfo["filesystem"].(string); ok {
+			metrics["filesystem"] = filesystem
+		}
+		if mountPoint, ok := diskInfo["mount_point"].(string); ok {
+			metrics["mount_point"] = mountPoint
+		}
+		if usagePercent, ok := diskInfo["usage_percent"].(int); ok {
+			metrics["usage_percent"] = usagePercent
+		}
+	} else {
+		log.Printf("DEBUG: PostgreSQL - Failed to get disk usage: %v", err)
+		metrics["total_disk"] = int64(0)
+		metrics["free_disk"] = int64(0)
+	}
+
+	// PostgreSQL Response Time
+	responseTime := c.measurePostgreSQLResponseTime()
+	metrics["response_time_ms"] = responseTime
+	log.Printf("DEBUG: PostgreSQL - Response time: %.6f ms", responseTime)
+
+	// IP Address
+	if ip := c.getLocalIP(); ip != "" {
+		metrics["ip_address"] = ip
+		log.Printf("DEBUG: PostgreSQL - IP address: %s", ip)
+	} else {
+		metrics["ip_address"] = "unknown"
+	}
+
+	log.Printf("DEBUG: PostgreSQL BatchCollectSystemMetrics - Collected %d metrics", len(metrics))
+	for key, value := range metrics {
+		log.Printf("DEBUG: PostgreSQL Metric[%s] = %v (type: %T)", key, value, value)
+	}
+
+	return metrics
+}
+
+// measurePostgreSQLResponseTime measures PostgreSQL response time with a simple query
+func (c *PostgresCollector) measurePostgreSQLResponseTime() float64 {
+	start := time.Now()
+
+	// Open database connection
+	db, err := c.openDB()
+	if err != nil {
+		log.Printf("DEBUG: PostgreSQL - Failed to open DB for response time measurement: %v", err)
+		return -1.0
+	}
+	defer db.Close()
+
+	// Execute simple query
+	var result int
+	err = db.QueryRow("SELECT 1").Scan(&result)
+	if err != nil {
+		log.Printf("DEBUG: PostgreSQL - Failed to execute response time query: %v", err)
+		return -1.0
+	}
+
+	duration := time.Since(start)
+	responseTimeMs := float64(duration.Nanoseconds()) / float64(time.Millisecond)
+
+	log.Printf("DEBUG: PostgreSQL - Response time measurement: %v (%.6f ms)", duration, responseTimeMs)
+	return responseTimeMs
+}
+
+// DetectPatroni detects if PostgreSQL is managed by Patroni
+func (c *PostgresCollector) DetectPatroni() *PatroniInfo {
+	logger.Info("PostgreSQL - Starting Patroni detection...")
+
+	patroniInfo := &PatroniInfo{
+		IsEnabled:     false,
+		DetectionInfo: "Detection started",
+	}
+
+	// Method 1: Check Patroni systemd service (most reliable and fast)
+	if c.checkPatroniService(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via systemd service")
+		return patroniInfo
+	}
+
+	// Method 2: Check Patroni REST API (reliable but requires running service)
+	if c.checkPatroniRestAPI(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via REST API")
+		return patroniInfo
+	}
+
+	// Method 3: Check system processes for Patroni
+	if c.checkPatroniProcess(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via system process")
+		return patroniInfo
+	}
+
+	// Method 4: Check for Patroni configuration files
+	if c.checkPatroniConfigFiles(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via configuration files")
+		return patroniInfo
+	}
+
+	// Method 5: Check PostgreSQL parameters for Patroni-specific settings (least reliable - prone to false positives)
+	if c.checkPatroniPostgreSQLParams(patroniInfo) {
+		logger.Info("PostgreSQL - Patroni detected via PostgreSQL parameters")
+		return patroniInfo
+	}
+
+	logger.Info("PostgreSQL - Patroni not detected")
+	patroniInfo.DetectionInfo = "Patroni not detected - checked REST API, PostgreSQL params, processes, and config files"
+	return patroniInfo
+}
+
+// checkPatroniService checks if Patroni systemd service exists and is installed
+func (c *PostgresCollector) checkPatroniService(patroniInfo *PatroniInfo) bool {
+	logger.Debug("PostgreSQL - Checking for Patroni systemd service...")
+
+	// Common Patroni service names
+	serviceNames := []string{
+		"patroni",
+		"patroni.service",
+		"postgresql-patroni",
+		"postgresql-patroni.service",
+	}
+
+	for _, serviceName := range serviceNames {
+		// Check if service exists (regardless of status)
+		cmd := exec.Command("systemctl", "status", serviceName)
+		output, err := cmd.Output()
+
+		if err == nil {
+			// Service exists - parse output for more details
+			outputStr := string(output)
+			logger.Debug("PostgreSQL - Found Patroni service '%s': %s", serviceName, strings.Split(outputStr, "\n")[0])
+
+			patroniInfo.IsEnabled = true
+			patroniInfo.DetectionInfo = fmt.Sprintf("Detected via systemd service: %s", serviceName)
+
+			// Try to extract state from systemctl output
+			if strings.Contains(outputStr, "Active: active (running)") {
+				patroniInfo.State = "running"
+			} else if strings.Contains(outputStr, "Active: inactive") {
+				patroniInfo.State = "stopped"
+			} else if strings.Contains(outputStr, "Active: failed") {
+				patroniInfo.State = "failed"
+			} else {
+				patroniInfo.State = "unknown"
+			}
+
+			logger.Info("PostgreSQL - Patroni service found: %s (state: %s)", serviceName, patroniInfo.State)
+			return true
+		}
+
+		// Check exit code for proper interpretation
+		if exitError, ok := err.(*exec.ExitError); ok {
+			exitCode := exitError.ExitCode()
+			logger.Debug("PostgreSQL - Service '%s' check returned exit code: %d", serviceName, exitCode)
+
+			// Systemctl exit codes:
+			// 0: running
+			// 1: dead
+			// 2: dead and pid file exists
+			// 3: not running (service exists but stopped)
+			// 4: no such service (unit not found) - means Patroni is NOT installed
+
+			if exitCode == 3 {
+				// Service exists but is stopped - Patroni is installed but not running
+				patroniInfo.IsEnabled = true
+				patroniInfo.DetectionInfo = fmt.Sprintf("Detected via systemd service (stopped): %s", serviceName)
+				patroniInfo.State = "stopped"
+				logger.Info("PostgreSQL - Patroni service found but stopped: %s", serviceName)
+				return true
+			}
+			// Exit code 4 means "Unit not found" - Patroni is NOT installed, continue checking
+			logger.Debug("PostgreSQL - Service '%s' not found (exit code %d)", serviceName, exitCode)
+		}
+	}
+
+	// Also try to check if patroni command exists in PATH
+	cmd := exec.Command("which", "patroni")
+	if err := cmd.Run(); err == nil {
+		logger.Debug("PostgreSQL - Patroni binary found in PATH")
+		// Binary exists but no service - could be manual setup
+		// This alone is not enough for detection, let other methods check
+	}
+
+	logger.Debug("PostgreSQL - No Patroni systemd service found")
+	return false
+}
+
+// checkPatroniRestAPI checks Patroni REST API (usually on port 8008)
+func (c *PostgresCollector) checkPatroniRestAPI(patroniInfo *PatroniInfo) bool {
+	// Common Patroni REST API ports
+	ports := []int{8008, 8009, 8010}
+
+	for _, port := range ports {
+		url := fmt.Sprintf("http://localhost:%d/patroni", port)
+
+		logger.Debug("PostgreSQL - Checking Patroni REST API at %s", url)
+
+		client := &http.Client{
+			Timeout: 3 * time.Second,
+		}
+
+		resp, err := client.Get(url)
+		if err != nil {
+			logger.Debug("PostgreSQL - Patroni REST API check failed for port %d: %v", port, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				logger.Warning("PostgreSQL - Failed to read Patroni REST API response: %v", err)
+				continue
+			}
+
+			var patroniResponse map[string]interface{}
+			if err := json.Unmarshal(body, &patroniResponse); err != nil {
+				logger.Warning("PostgreSQL - Failed to parse Patroni REST API response: %v", err)
+				continue
+			}
+
+			// Extract Patroni information
+			patroniInfo.IsEnabled = true
+			patroniInfo.RestAPIPort = port
+			patroniInfo.DetectionInfo = fmt.Sprintf("Detected via REST API on port %d", port)
+
+			if cluster, ok := patroniResponse["cluster"].(string); ok {
+				patroniInfo.ClusterName = cluster
+			}
+
+			if member, ok := patroniResponse["member"].(string); ok {
+				patroniInfo.MemberName = member
+			}
+
+			if role, ok := patroniResponse["role"].(string); ok {
+				patroniInfo.Role = strings.Title(role)
+			}
+
+			if state, ok := patroniResponse["state"].(string); ok {
+				patroniInfo.State = state
+			}
+
+			logger.Info("PostgreSQL - Patroni REST API found: cluster=%s, member=%s, role=%s, state=%s",
+				patroniInfo.ClusterName, patroniInfo.MemberName, patroniInfo.Role, patroniInfo.State)
+			return true
+		}
+	}
+
+	return false
+}
+
+// checkPatroniPostgreSQLParams checks PostgreSQL parameters for Patroni-specific settings
+func (c *PostgresCollector) checkPatroniPostgreSQLParams(patroniInfo *PatroniInfo) bool {
+	db, err := c.openDB()
+	if err != nil {
+		logger.Warning("PostgreSQL - Failed to connect to database for Patroni parameter check: %v", err)
+		return false
+	}
+	defer db.Close()
+
+	// Check for Patroni-specific parameters
+	patroniParams := []string{
+		"cluster_name",
+		"wal_level",
+		"hot_standby",
+		"max_connections",
+		"max_wal_senders",
+		"max_replication_slots",
+	}
+
+	detectedParams := make(map[string]string)
+	patroniIndicators := 0
+
+	for _, param := range patroniParams {
+		var value string
+		query := fmt.Sprintf("SELECT setting FROM pg_settings WHERE name = '%s'", param)
+		err := db.QueryRow(query).Scan(&value)
+		if err != nil {
+			continue
+		}
+
+		detectedParams[param] = value
+
+		// Check for Patroni-typical configurations
+		switch param {
+		case "wal_level":
+			if value == "replica" || value == "logical" {
+				patroniIndicators++
+			}
+		case "hot_standby":
+			if value == "on" {
+				patroniIndicators++
+			}
+		case "max_wal_senders":
+			if val, err := strconv.Atoi(value); err == nil && val > 0 {
+				patroniIndicators++
+			}
+		case "max_replication_slots":
+			if val, err := strconv.Atoi(value); err == nil && val > 0 {
+				patroniIndicators++
+			}
+		}
+	}
+
+	// Check for cluster_name parameter specifically (Patroni usually sets this)
+	if clusterName, exists := detectedParams["cluster_name"]; exists && clusterName != "" {
+		patroniInfo.ClusterName = clusterName
+		patroniIndicators += 2 // cluster_name is a strong indicator
+	}
+
+	// Check for Patroni-specific functions or views
+	var patroniViewCount int
+	viewQuery := `
+		SELECT COUNT(*) 
+		FROM information_schema.tables 
+		WHERE table_schema = 'public' 
+		AND table_name LIKE '%patroni%'
+	`
+	db.QueryRow(viewQuery).Scan(&patroniViewCount)
+
+	if patroniViewCount > 0 {
+		patroniIndicators++
+	}
+
+	// Check for Patroni-specific settings that are more conclusive
+	var patroniSpecificParams int
+
+	// Check for Patroni-specific parameter combinations that are strong indicators
+	if clusterName, exists := detectedParams["cluster_name"]; exists && clusterName != "" {
+		// Only count cluster_name if it follows Patroni naming patterns
+		if isPatroniClusterName(clusterName) {
+			patroniSpecificParams += 3
+		}
+	}
+
+	// If we have strong Patroni-specific indicators AND enough general indicators, consider it Patroni-managed
+	// Raised threshold to be more conservative and avoid false positives
+	if patroniSpecificParams >= 3 && patroniIndicators >= 5 {
+		patroniInfo.IsEnabled = true
+		patroniInfo.DetectionInfo = fmt.Sprintf("Detected via PostgreSQL parameters (indicators: %d, specific: %d)", patroniIndicators, patroniSpecificParams)
+
+		// Try to determine role from replication status
+		var isInRecovery bool
+		err = db.QueryRow("SELECT pg_is_in_recovery()").Scan(&isInRecovery)
+		if err == nil {
+			if isInRecovery {
+				patroniInfo.Role = "Replica"
+			} else {
+				patroniInfo.Role = "Leader"
+			}
+		}
+
+		logger.Info("PostgreSQL - Patroni detected via parameters: cluster=%s, role=%s",
+			patroniInfo.ClusterName, patroniInfo.Role)
+		return true
+	}
+
+	logger.Debug("PostgreSQL - Patroni parameter indicators (%d) below threshold for detection", patroniIndicators)
+
+	return false
+}
+
+// checkPatroniProcess checks if Patroni process is running
+func (c *PostgresCollector) checkPatroniProcess(patroniInfo *PatroniInfo) bool {
+	// Check for Patroni process using ps command
+	cmd := exec.Command("ps", "aux")
+	output, err := cmd.Output()
+	if err != nil {
+		logger.Warning("PostgreSQL - Failed to execute ps command for Patroni process check: %v", err)
+		return false
+	}
+
+	outputStr := string(output)
+	lines := strings.Split(outputStr, "\n")
+
+	for _, line := range lines {
+		if strings.Contains(strings.ToLower(line), "patroni") {
+			patroniInfo.IsEnabled = true
+			patroniInfo.DetectionInfo = "Detected via system process"
+
+			// Try to extract more information from the process line
+			if strings.Contains(line, "patroni") && strings.Contains(line, "python") {
+				patroniInfo.State = "running"
+			}
+
+			logger.Info("PostgreSQL - Patroni process found: %s", strings.TrimSpace(line))
+			return true
+		}
+	}
+
+	// Also check with pgrep if available
+	cmd = exec.Command("pgrep", "-f", "patroni")
+	output, err = cmd.Output()
+	if err == nil && len(output) > 0 {
+		patroniInfo.IsEnabled = true
+		patroniInfo.DetectionInfo = "Detected via pgrep"
+		patroniInfo.State = "running"
+		logger.Info("PostgreSQL - Patroni process found via pgrep")
+		return true
+	}
+
+	return false
+}
+
+// checkPatroniConfigFiles checks for Patroni configuration files
+func (c *PostgresCollector) checkPatroniConfigFiles(patroniInfo *PatroniInfo) bool {
+	// Common Patroni config file locations
+	configPaths := []string{
+		"/etc/patroni/patroni.yml",
+		"/etc/patroni.yml",
+		"/opt/patroni/patroni.yml",
+		"/usr/local/etc/patroni.yml",
+		"/var/lib/postgresql/patroni.yml",
+	}
+
+	for _, configPath := range configPaths {
+		if _, err := os.Stat(configPath); err == nil {
+			patroniInfo.IsEnabled = true
+			patroniInfo.DetectionInfo = fmt.Sprintf("Detected via config file: %s", configPath)
+
+			// Try to read basic info from config file
+			if content, err := os.ReadFile(configPath); err == nil {
+				contentStr := string(content)
+
+				// Extract cluster name from YAML config
+				if lines := strings.Split(contentStr, "\n"); len(lines) > 0 {
+					for _, line := range lines {
+						line = strings.TrimSpace(line)
+						if strings.HasPrefix(line, "name:") {
+							if parts := strings.Split(line, ":"); len(parts) > 1 {
+								patroniInfo.ClusterName = strings.TrimSpace(parts[1])
+							}
+						}
+						if strings.HasPrefix(line, "scope:") {
+							if parts := strings.Split(line, ":"); len(parts) > 1 {
+								if patroniInfo.ClusterName == "" {
+									patroniInfo.ClusterName = strings.TrimSpace(parts[1])
+								}
+							}
+						}
+					}
+				}
+			}
+
+			logger.Info("PostgreSQL - Patroni config file found: %s, cluster=%s",
+				configPath, patroniInfo.ClusterName)
+			return true
+		}
+	}
+
+	return false
+}
+
+// isPatroniClusterName checks if cluster name follows Patroni naming patterns
+func isPatroniClusterName(clusterName string) bool {
+	// Patroni typically doesn't use simple version/path patterns like "15/main"
+	// which are more common in traditional PostgreSQL setups
+
+	// Common non-Patroni patterns that should be rejected
+	nonPatroniPatterns := []string{
+		"/main",    // PostgreSQL version paths like "15/main", "14/main"
+		"/primary", // Traditional setup patterns
+		"/data",    // Data directory patterns
+	}
+
+	for _, pattern := range nonPatroniPatterns {
+		if strings.Contains(clusterName, pattern) {
+			return false
+		}
+	}
+
+	// Simple version numbers alone are not typically Patroni clusters
+	if matched, _ := regexp.MatchString("^[0-9]+(\\.?[0-9]+)*$", clusterName); matched {
+		return false
+	}
+
+	// Version/path patterns like "15/main" are not typically Patroni
+	if matched, _ := regexp.MatchString("^[0-9]+/[a-z]+$", clusterName); matched {
+		return false
+	}
+
+	// If none of the exclusion patterns match, it could be a Patroni cluster name
+	// Patroni cluster names are usually more descriptive like "postgres-prod", "pg-cluster" etc.
+	return len(clusterName) > 2 && !strings.Contains(clusterName, "/")
+}
+
+// TestPatroniDetection tests the Patroni detection functionality
+func (c *PostgresCollector) TestPatroniDetection() {
+	logger.Info("PostgreSQL - Testing Patroni detection functionality...")
+
+	patroniInfo := c.DetectPatroni()
+
+	logger.Info("========== PATRONI DETECTION TEST RESULTS ==========")
+	logger.Info("Patroni Enabled: %t", patroniInfo.IsEnabled)
+	logger.Info("Cluster Name: %s", patroniInfo.ClusterName)
+	logger.Info("Member Name: %s", patroniInfo.MemberName)
+	logger.Info("Role: %s", patroniInfo.Role)
+	logger.Info("State: %s", patroniInfo.State)
+	logger.Info("REST API Port: %d", patroniInfo.RestAPIPort)
+	logger.Info("Detection Info: %s", patroniInfo.DetectionInfo)
+	logger.Info("=================================================")
+
+	if patroniInfo.IsEnabled {
+		logger.Info("✅ Patroni DETECTED - PostgreSQL cluster is managed by Patroni")
+		logger.Info("   - Detection method: %s", patroniInfo.DetectionInfo)
+		if patroniInfo.ClusterName != "" {
+			logger.Info("   - Cluster: %s", patroniInfo.ClusterName)
+		}
+		if patroniInfo.Role != "" {
+			logger.Info("   - Role: %s", patroniInfo.Role)
+		}
+		if patroniInfo.RestAPIPort > 0 {
+			logger.Info("   - REST API Port: %d", patroniInfo.RestAPIPort)
+		}
+	} else {
+		logger.Info("❌ Patroni NOT DETECTED - PostgreSQL appears to be standalone or managed by other HA solution")
+		logger.Info("   - Check details: %s", patroniInfo.DetectionInfo)
+	}
+}
+
+// Global TestPatroniDetection function for easy testing
+func TestPatroniDetection() {
+	logger.Info("Starting global Patroni detection test...")
+
+	// Use default configuration
+	cfg, err := config.LoadAgentConfig()
+	if err != nil {
+		logger.Error("Failed to load configuration: %v", err)
+		return
+	}
+
+	// Create collector instance
+	collector := NewPostgresCollector(cfg)
+
+	// Run the test
+	collector.TestPatroniDetection()
+}
+
+// NewPatroniManager creates a new Patroni manager instance
+func NewPatroniManager(cfg *config.AgentConfig) *PatroniManager {
+	configPath := findPatroniConfigPath()
+
+	return &PatroniManager{
+		cfg:           cfg,
+		patroniCtlCmd: findPatroniCtlCommand(),
+		configPath:    configPath,
+	}
+}
+
+// findPatroniCtlCommand finds the patronictl command path
+func findPatroniCtlCommand() string {
+	// Common paths for patronictl
+	commonPaths := []string{
+		"/usr/local/bin/patronictl",
+		"/usr/bin/patronictl",
+		"/opt/patroni/bin/patronictl",
+		"patronictl", // In PATH
+	}
+
+	for _, path := range commonPaths {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+
+		// Check if it's in PATH
+		if path == "patronictl" {
+			cmd := exec.Command("which", "patronictl")
+			if err := cmd.Run(); err == nil {
+				return "patronictl"
+			}
+		}
+	}
+
+	return ""
+}
+
+// findPatroniConfigPath finds the patroni config file path
+func findPatroniConfigPath() string {
+	// Common Patroni config file locations
+	configPaths := []string{
+		"/etc/patroni.yml",
+		"/etc/patroni.yaml",
+		"/etc/patroni/patroni.yml",
+		"/etc/patroni/patroni.yaml",
+		"/opt/patroni/patroni.yml",
+		"/opt/patroni/patroni.yaml",
+		"/usr/local/etc/patroni.yml",
+		"/usr/local/etc/patroni.yaml",
+		"/var/lib/postgresql/patroni.yml",
+		"/var/lib/postgresql/patroni.yaml",
+	}
+
+	for _, configPath := range configPaths {
+		if _, err := os.Stat(configPath); err == nil {
+			logger.Debug("PostgreSQL - Found Patroni config file: %s", configPath)
+			return configPath
+		}
+	}
+
+	logger.Debug("PostgreSQL - No Patroni config file found in common locations")
+	return ""
+}
+
+// getClusterNameFromConfig extracts cluster name from patroni config file
+func getClusterNameFromConfig(configPath string) string {
+	if configPath == "" {
+		return ""
+	}
+
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		logger.Warning("PostgreSQL - Failed to read Patroni config file %s: %v", configPath, err)
+		return ""
+	}
+
+	contentStr := string(content)
+	lines := strings.Split(contentStr, "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		// Look for scope: or name: fields
+		if strings.HasPrefix(line, "scope:") {
+			if parts := strings.Split(line, ":"); len(parts) > 1 {
+				scope := strings.TrimSpace(parts[1])
+				scope = strings.Trim(scope, `"'`) // Remove quotes
+				if scope != "" {
+					logger.Info("PostgreSQL - Found cluster scope in config: %s", scope)
+					return scope
+				}
+			}
+		}
+
+		if strings.HasPrefix(line, "name:") {
+			if parts := strings.Split(line, ":"); len(parts) > 1 {
+				name := strings.TrimSpace(parts[1])
+				name = strings.Trim(name, `"'`) // Remove quotes
+				if name != "" {
+					logger.Info("PostgreSQL - Found cluster name in config: %s", name)
+					return name
+				}
+			}
+		}
+	}
+
+	logger.Warning("PostgreSQL - No cluster name found in Patroni config file")
+	return ""
+}
+
+// IsPatroniAvailable checks if Patroni is available for management
+func (pm *PatroniManager) IsPatroniAvailable() (bool, error) {
+	if pm.patroniCtlCmd == "" {
+		return false, fmt.Errorf("patronictl command not found")
+	}
+
+	// Test patronictl command with --help (more universally supported than --version)
+	cmd := exec.Command(pm.patroniCtlCmd, "--help")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("patronictl command failed: %v", err)
+	}
+
+	// Check if output contains expected patronictl help text
+	outputStr := string(output)
+	if !strings.Contains(outputStr, "patronictl") && !strings.Contains(outputStr, "COMMAND") {
+		return false, fmt.Errorf("patronictl command output unexpected: %s", outputStr)
+	}
+
+	return true, nil
+}
+
+// ExecutePatroniCommand executes a patronictl command safely
+func (pm *PatroniManager) ExecutePatroniCommand(commandName string, additionalArgs []string) (*PatroniCommandResult, error) {
+	// Check if command exists
+	command, exists := PatroniCommands[commandName]
+	if !exists {
+		return nil, fmt.Errorf("unknown Patroni command: %s", commandName)
+	}
+
+	// Check if patronictl is available
+	if available, err := pm.IsPatroniAvailable(); !available {
+		return nil, fmt.Errorf("patronictl not available: %v", err)
+	}
+
+	// Build command arguments with config file
+	args := []string{}
+
+	// Add config file if available
+	if pm.configPath != "" {
+		args = append(args, "-c", pm.configPath)
+	}
+
+	// Add the main command
+	args = append(args, command.Command)
+	args = append(args, command.Args...)
+	args = append(args, additionalArgs...)
+
+	// Get cluster name from multiple sources
+	clusterName := pm.getClusterName()
+	if clusterName != "" {
+		args = append(args, clusterName)
+	}
+
+	logger.Info("Executing Patroni command: %s %v", pm.patroniCtlCmd, args)
+
+	// Execute command with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, pm.patroniCtlCmd, args...)
+	output, err := cmd.CombinedOutput()
+
+	result := &PatroniCommandResult{
+		Command:    commandName,
+		Args:       args,
+		Output:     string(output),
+		Success:    err == nil,
+		ExecutedAt: time.Now(),
+		Duration:   time.Since(time.Now()),
+	}
+
+	if err != nil {
+		result.Error = err.Error()
+		logger.Error("Patroni command failed: %s %v - Error: %v", pm.patroniCtlCmd, args, err)
+		logger.Error("Command output: %s", string(output))
+	} else {
+		logger.Info("Patroni command successful: %s %v", pm.patroniCtlCmd, args)
+		logger.Debug("Command output: %s", string(output))
+	}
+
+	return result, nil
+}
+
+// PatroniCommandResult represents the result of a patronictl command execution
+type PatroniCommandResult struct {
+	Command    string            `json:"command"`
+	Args       []string          `json:"args"`
+	Output     string            `json:"output"`
+	Success    bool              `json:"success"`
+	Error      string            `json:"error,omitempty"`
+	ExecutedAt time.Time         `json:"executed_at"`
+	Duration   time.Duration     `json:"duration"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+}
+
+// GetClusterStatus gets the current cluster status using patronictl list
+func (pm *PatroniManager) GetClusterStatus() (*PatroniCommandResult, error) {
+	return pm.ExecutePatroniCommand("list", []string{})
+}
+
+// GetClusterTopology gets the cluster topology using patronictl topology
+func (pm *PatroniManager) GetClusterTopology() (*PatroniCommandResult, error) {
+	return pm.ExecutePatroniCommand("topology", []string{})
+}
+
+// GetClusterHistory gets the cluster history using patronictl history
+func (pm *PatroniManager) GetClusterHistory() (*PatroniCommandResult, error) {
+	return pm.ExecutePatroniCommand("history", []string{})
+}
+
+// ReloadNode reloads configuration on the current node
+func (pm *PatroniManager) ReloadNode() (*PatroniCommandResult, error) {
+	return pm.ExecutePatroniCommand("reload", []string{})
+}
+
+// RestartNode restarts PostgreSQL on the current node
+func (pm *PatroniManager) RestartNode() (*PatroniCommandResult, error) {
+	return pm.ExecutePatroniCommand("restart", []string{})
+}
+
+// PauseCluster puts the cluster in maintenance mode
+func (pm *PatroniManager) PauseCluster() (*PatroniCommandResult, error) {
+	return pm.ExecutePatroniCommand("pause", []string{})
+}
+
+// ResumeCluster resumes the cluster from maintenance mode
+func (pm *PatroniManager) ResumeCluster() (*PatroniCommandResult, error) {
+	return pm.ExecutePatroniCommand("resume", []string{})
+}
+
+// PerformFailover performs a manual failover
+func (pm *PatroniManager) PerformFailover(targetNode string) (*PatroniCommandResult, error) {
+	args := []string{}
+	if targetNode != "" {
+		args = append(args, "--candidate", targetNode)
+	}
+	// --force is already included in PatroniCommands["failover"].Args
+	return pm.ExecutePatroniCommand("failover", args)
+}
+
+// PerformSwitchover performs a planned switchover
+func (pm *PatroniManager) PerformSwitchover(targetNode string) (*PatroniCommandResult, error) {
+	args := []string{}
+	if targetNode != "" {
+		args = append(args, "--candidate", targetNode)
+	}
+	// --force is already included in PatroniCommands["switchover"].Args
+	return pm.ExecutePatroniCommand("switchover", args)
+}
+
+// SetPatroniInfo sets the Patroni information for the manager
+func (pm *PatroniManager) SetPatroniInfo(info *PatroniInfo) {
+	pm.patroniInfo = info
+}
+
+// getClusterName gets cluster name from multiple sources
+func (pm *PatroniManager) getClusterName() string {
+	// Priority 1: From PatroniInfo (detected from system)
+	if pm.patroniInfo != nil && pm.patroniInfo.ClusterName != "" {
+		// Skip non-Patroni cluster names like "15/main"
+		if !strings.Contains(pm.patroniInfo.ClusterName, "/") {
+			logger.Debug("PostgreSQL - Using cluster name from PatroniInfo: %s", pm.patroniInfo.ClusterName)
+			return pm.patroniInfo.ClusterName
+		}
+	}
+
+	// Priority 2: From config file
+	if pm.configPath != "" {
+		configClusterName := getClusterNameFromConfig(pm.configPath)
+		if configClusterName != "" {
+			logger.Debug("PostgreSQL - Using cluster name from config file: %s", configClusterName)
+			return configClusterName
+		}
+	}
+
+	// Priority 3: Try to get from patronictl itself
+	if pm.patroniCtlCmd != "" {
+		clusterName := pm.getClusterNameFromPatronictl()
+		if clusterName != "" {
+			logger.Debug("PostgreSQL - Using cluster name from patronictl: %s", clusterName)
+			return clusterName
+		}
+	}
+
+	logger.Warning("PostgreSQL - No cluster name found from any source")
+	return ""
+}
+
+// getClusterNameFromPatronictl tries to get cluster name from patronictl list command
+func (pm *PatroniManager) getClusterNameFromPatronictl() string {
+	if pm.patroniCtlCmd == "" {
+		return ""
+	}
+
+	// Try to run patronictl list without cluster name to see available clusters
+	args := []string{}
+	if pm.configPath != "" {
+		args = append(args, "-c", pm.configPath)
+	}
+	args = append(args, "list")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, pm.patroniCtlCmd, args...)
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		logger.Debug("PostgreSQL - Failed to get cluster name from patronictl: %v", err)
+		return ""
+	}
+
+	outputStr := string(output)
+	lines := strings.Split(outputStr, "\n")
+
+	// Look for cluster name in the output
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "+ Cluster:") {
+			// Format: "+ Cluster: cluster-name -------"
+			parts := strings.Fields(line)
+			if len(parts) >= 3 {
+				clusterName := parts[2]
+				logger.Debug("PostgreSQL - Found cluster name from patronictl output: %s", clusterName)
+				return clusterName
+			}
+		}
+	}
+
+	logger.Debug("PostgreSQL - No cluster name found in patronictl output")
+	return ""
+}
+
+// GetAvailableCommands returns all available Patroni commands
+func (pm *PatroniManager) GetAvailableCommands() map[string]PatroniCommand {
+	return PatroniCommands
+}
+
+// TestPatroniSetup tests the complete Patroni setup and reports detailed information
+func (pm *PatroniManager) TestPatroniSetup() map[string]interface{} {
+	result := map[string]interface{}{
+		"patronictl_path": pm.patroniCtlCmd,
+		"config_path":     pm.configPath,
+		"tests":           map[string]interface{}{},
+	}
+
+	tests := result["tests"].(map[string]interface{})
+
+	// Test 1: patronictl command exists
+	if pm.patroniCtlCmd == "" {
+		tests["patronictl_found"] = map[string]interface{}{
+			"status": "failed",
+			"error":  "patronictl command not found in common paths",
+		}
+		return result
+	} else {
+		tests["patronictl_found"] = map[string]interface{}{
+			"status": "success",
+			"path":   pm.patroniCtlCmd,
+		}
+	}
+
+	// Test 2: patroni --version (correct way to get Patroni version)
+	cmd := exec.Command("patroni", "--version")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		tests["patroni_version"] = map[string]interface{}{
+			"status": "failed",
+			"error":  err.Error(),
+			"output": string(output),
+		}
+	} else {
+		tests["patroni_version"] = map[string]interface{}{
+			"status": "success",
+			"output": strings.TrimSpace(string(output)),
+		}
+	}
+
+	// Test 3: patronictl --help (test patronictl command works)
+	cmd = exec.Command(pm.patroniCtlCmd, "--help")
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		tests["patronictl_help"] = map[string]interface{}{
+			"status": "failed",
+			"error":  err.Error(),
+			"output": string(output),
+		}
+	} else {
+		outputStr := string(output)
+		// Check if it looks like patronictl help output
+		if strings.Contains(outputStr, "patronictl") || strings.Contains(outputStr, "COMMAND") {
+			tests["patronictl_help"] = map[string]interface{}{
+				"status": "success",
+				"output": "patronictl help command works",
+			}
+		} else {
+			tests["patronictl_help"] = map[string]interface{}{
+				"status": "failed",
+				"error":  "Unexpected help output",
+				"output": strings.TrimSpace(outputStr),
+			}
+		}
+	}
+
+	// Test 4: Config file exists
+	if pm.configPath == "" {
+		tests["config_file"] = map[string]interface{}{
+			"status": "failed",
+			"error":  "Patroni config file not found in common paths",
+		}
+	} else {
+		tests["config_file"] = map[string]interface{}{
+			"status": "success",
+			"path":   pm.configPath,
+		}
+
+		// Test 5: Read cluster name from config
+		clusterName := getClusterNameFromConfig(pm.configPath)
+		if clusterName == "" {
+			tests["cluster_name_from_config"] = map[string]interface{}{
+				"status": "failed",
+				"error":  "Could not extract cluster name from config file",
+			}
+		} else {
+			tests["cluster_name_from_config"] = map[string]interface{}{
+				"status":       "success",
+				"cluster_name": clusterName,
+			}
+		}
+	}
+
+	// Test 6: patronictl list (without cluster name)
+	if pm.patroniCtlCmd != "" {
+		args := []string{}
+		if pm.configPath != "" {
+			args = append(args, "-c", pm.configPath)
+		}
+		args = append(args, "list")
+
+		cmd := exec.Command(pm.patroniCtlCmd, args...)
+		output, err := cmd.CombinedOutput()
+
+		if err != nil {
+			tests["patronictl_list"] = map[string]interface{}{
+				"status":    "failed",
+				"error":     err.Error(),
+				"output":    string(output),
+				"command":   fmt.Sprintf("%s %v", pm.patroniCtlCmd, args),
+				"exit_code": cmd.ProcessState.ExitCode(),
+			}
+		} else {
+			tests["patronictl_list"] = map[string]interface{}{
+				"status":  "success",
+				"output":  string(output),
+				"command": fmt.Sprintf("%s %v", pm.patroniCtlCmd, args),
+			}
+		}
+	}
+
+	return result
+}
+
+// convertToBytes converts size strings like "1.2G", "500M" to bytes
+func convertToBytes(size string) (uint64, error) {
+	size = strings.TrimSpace(size)
+	if len(size) == 0 {
+		return 0, fmt.Errorf("empty size")
+	}
+
+	// Sayısal kısmı ve birimi ayır
+	var num float64
+	var unit string
+	
+	// Birim çıkarma (GB, MB, KB + Gi, Mi, Ki gibi işletim sistemi birimlerini de destekle)
+	if strings.HasSuffix(size, " GB") {
+		num, _ = strconv.ParseFloat(size[:len(size)-3], 64)
+		unit = "G"
+	} else if strings.HasSuffix(size, " MB") {
+		num, _ = strconv.ParseFloat(size[:len(size)-3], 64)
+		unit = "M"
+	} else if strings.HasSuffix(size, " KB") {
+		num, _ = strconv.ParseFloat(size[:len(size)-3], 64)
+		unit = "K"
+	} else if strings.HasSuffix(size, " TB") {
+		num, _ = strconv.ParseFloat(size[:len(size)-3], 64)
+		unit = "T"
+	} else if strings.HasSuffix(size, " B") {
+		num, _ = strconv.ParseFloat(size[:len(size)-2], 64)
+		unit = "B"
+	} else if strings.HasSuffix(size, "Gi") {
+		num, _ = strconv.ParseFloat(size[:len(size)-2], 64)
+		unit = "G"
+	} else if strings.HasSuffix(size, "Mi") {
+		num, _ = strconv.ParseFloat(size[:len(size)-2], 64)
+		unit = "M"
+	} else if strings.HasSuffix(size, "Ki") {
+		num, _ = strconv.ParseFloat(size[:len(size)-2], 64)
+		unit = "K"
+	} else if strings.HasSuffix(size, "Ti") {
+		num, _ = strconv.ParseFloat(size[:len(size)-2], 64)
+		unit = "T"
+	} else if strings.HasSuffix(size, "Bi") {
+		num, _ = strconv.ParseFloat(size[:len(size)-2], 64)
+		unit = "B"
+	} else {
+		last := size[len(size)-1]
+		if last >= '0' && last <= '9' {
+			num, _ = strconv.ParseFloat(size, 64)
+			unit = "B"
+		} else {
+			num, _ = strconv.ParseFloat(size[:len(size)-1], 64)
+			unit = strings.ToUpper(size[len(size)-1:])
+		}
+	}
+
+	// Birimi byte cinsine çevir
+	multiplier := uint64(1)
+	switch unit {
+	case "K":
+		multiplier = 1024
+	case "M":
+		multiplier = 1024 * 1024
+	case "G":
+		multiplier = 1024 * 1024 * 1024
+	case "T":
+		multiplier = 1024 * 1024 * 1024 * 1024
+	case "P":
+		multiplier = 1024 * 1024 * 1024 * 1024 * 1024
+	}
+
+	return uint64(num * float64(multiplier)), nil
+}
